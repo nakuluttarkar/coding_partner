@@ -23,14 +23,14 @@ user_prompt = "Create a simple calculator web app using html, css, and javascrip
 def planner_agent(state: dict) -> dict:
     print("\n ------- ENTERING PLANNER AGENT-------\n")
     user_prompt = state["user_prompt"]
-    resp = groq_model_gpt_20b.with_structured_output(Plan).invoke(planner_prompt(user_prompt))
+    resp = groq_model_gpt_120b.with_structured_output(Plan).invoke(planner_prompt(user_prompt))
     print(resp)
     return {"plan": resp}
 
 def architect_agent(state: dict) -> dict:
     print("\n ------- ENTERING ARCHITECT AGENT-------\n")
     plan: Plan = state["plan"]
-    resp = groq_model_gpt_20b.with_structured_output(TaskPlan, method="function_calling").invoke(architect_prompt(plan))
+    resp = groq_model_gpt_120b.with_structured_output(TaskPlan, method="function_calling").invoke(architect_prompt(plan))
     if resp is None:
         raise ValueError("No response from Architect")
     print(resp)
@@ -61,7 +61,7 @@ def coding_agent(state: dict) -> dict :
 
     coder_tools = [read_file, write_file, list_files, get_current_directory]
 
-    coder_agent = create_react_agent(groq_model_gpt_20b, coder_tools)
+    coder_agent = create_react_agent(groq_model_gpt_120b, coder_tools)
 
     coder_agent.invoke(
     {
