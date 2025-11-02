@@ -1,5 +1,4 @@
 from langchain_groq import ChatGroq
-from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.graph.message import add_messages
@@ -17,7 +16,6 @@ load_dotenv()
 groq_model_gpt_20b = ChatGroq(model="openai/gpt-oss-20b", api_key=os.getenv("GROQ_API_KEY"))
 groq_model_gpt_120b = ChatGroq(model="openai/gpt-oss-120b", api_key=os.getenv("GROQ_API_KEY"))
 groq_model_llama_4_scout_17b = ChatGroq(model="meta-llama/llama-4-scout-17b-16e-instruct", api_key=os.getenv("GROQ_API_KEY"))
-openai_model = ChatOpenAI(model="gpt-4o-mini", api_key=os.getenv("OPENAI_API_KEY"))
 
 user_prompt = "Create a simple calculator web app using html, css, and javascript"
 
