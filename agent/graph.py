@@ -8,6 +8,7 @@ from .prompts import *
 from .states import *
 from agent.tools import write_file, read_file, get_current_directory, list_files
 from dotenv import load_dotenv
+from .utils import safe_invoke
 
 
 import os
@@ -23,14 +24,23 @@ user_prompt = "Create a simple calculator web app using html, css, and javascrip
 def planner_agent(state: dict) -> dict:
     print("\n ------- ENTERING PLANNER AGENT-------\n")
     user_prompt = state["user_prompt"]
-    resp = groq_model_gpt_120b.with_structured_output(Plan).invoke(planner_prompt(user_prompt))
+    resp = safe_invoke(
+        [groq_model_gpt_120b, groq_model_gpt_20b, groq_model_llama_4_scout_17b],
+        structured_output=Plan,
+        prompt=planner_prompt(user_prompt)
+    )
     print(resp)
     return {"plan": resp}
 
 def architect_agent(state: dict) -> dict:
     print("\n ------- ENTERING ARCHITECT AGENT-------\n")
     plan: Plan = state["plan"]
-    resp = groq_model_gpt_120b.with_structured_output(TaskPlan, method="function_calling").invoke(architect_prompt(plan))
+    resp = safe_invoke(
+        [groq_model_gpt_120b, groq_model_gpt_20b, groq_model_llama_4_scout_17b],
+        structured_output=TaskPlan,
+        method="function_calling",
+        prompt=architect_prompt(plan)
+    )
     if resp is None:
         raise ValueError("No response from Architect")
     print(resp)
@@ -63,20 +73,26 @@ def coding_agent(state: dict) -> dict :
 
     coder_agent = create_react_agent(groq_model_gpt_120b, coder_tools)
 
-    coder_agent.invoke(
-    {
-        'messages': [
-            {'role': 'system', 'content': system_prompt},
-            {'role': 'user', 'content': user_prompt}
-        ]
-    },
-    {
-        "tools": coder_tools 
-    }
-    )
-                        
+    for model in [groq_model_gpt_120b, groq_model_gpt_20b, groq_model_llama_4_scout_17b]:
+        try:
+            print(f"\nCoding with model: {model.model_name}")
+            coder_agent = create_react_agent(model, coder_tools)
+            coder_agent.invoke(
+                {
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ]
+                },
+                {"tools": coder_tools}
+            )
+            break
+        except Exception as e:
+            print(f"⚠️ Coding agent failed with {model.model_name}: {str(e)}")
+            continue
+
     coder_state.current_step_idx += 1
-    return {'coder_state': coder_state}
+    return {"coder_state": coder_state}
     
 
     

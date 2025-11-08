@@ -1,3 +1,4 @@
-HTML
-CSS
-JavaScript
+# This project is a pure front‑end application and does not require any Python packages.
+# Development dependencies (optional)
+live-server>=1.2.1
+prettier>=3.0.0
