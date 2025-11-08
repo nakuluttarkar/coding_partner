@@ -19,7 +19,6 @@ st.title("Coder Buddy")
 
 user_prompt = st.text_area("Enter your project prompt", placeholder="e.g. 'Build a colourful modern todo app in html css and js'")
 
-recursion_limit = st.number_input("Enter the recursion limit", value=100, min_value=1, max_value=1000)
 
 if st.button("Generate Project"):
     if not user_prompt.strip():
@@ -28,9 +27,8 @@ if st.button("Generate Project"):
     
         try:
             with st.spinner("Generating project..."):
-                result = agent.invoke({"user_prompt": user_prompt}, {"recursion_limit": recursion_limit})
+                result = agent.invoke({"user_prompt": user_prompt}, {"recursion_limit": 100})
             st.success("Project generated successfully")
-            st.write("Final State:", result)
             st.subheader("Generated Project Files")
             files = list_files.run(".").splitlines()
             if files:
