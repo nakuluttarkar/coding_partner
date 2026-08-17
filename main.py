@@ -29,7 +29,4 @@ def main():
 
 
 if __name__ == "__main__":
-    prompt = input("Enter the prompt")
-    result = agent.invoke({"user_prompt": prompt},
-                          {"recursion_limit": 100})
-    print("Final State:", result)
+    main()

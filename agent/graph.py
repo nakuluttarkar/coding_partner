@@ -71,8 +71,7 @@ def coding_agent(state: dict) -> dict :
 
     coder_tools = [read_file, write_file, list_files, get_current_directory]
 
-    coder_agent = create_react_agent(groq_model_gpt_120b, coder_tools)
-
+    errors = []
     for model in [groq_model_gpt_120b, groq_model_gpt_20b, groq_model_llama_4_scout_17b]:
         try:
             print(f"\nCoding with model: {model.model_name}")
@@ -83,13 +82,20 @@ def coding_agent(state: dict) -> dict :
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt}
                     ]
-                },
-                {"tools": coder_tools}
+                }
             )
             break
         except Exception as e:
             print(f"⚠️ Coding agent failed with {model.model_name}: {str(e)}")
+            errors.append(f"{model.model_name}: {e}")
             continue
+    else:
+        # Every model failed. Advancing here would silently skip the file and
+        # report success on a project that was never fully written.
+        raise RuntimeError(
+            f"All models failed on step {coder_state.current_step_idx + 1}/{len(steps)} "
+            f"({current_task.filepath}). Errors: " + " | ".join(errors)
+        )
 
     coder_state.current_step_idx += 1
     return {"coder_state": coder_state}

@@ -1,9 +1,11 @@
-groq>=0.31.0
-langchain>=0.3.27
-langchain-core>=0.3.7
-langchain-groq>=0.3.7
-langgraph>=0.6.3
-pip>=25.2
-pydantic>=2.11.7
-python-dotenv>=1.1.1
-streamlit>=1.30.0
+# Kept in sync with pyproject.toml. Upper bounds matter: langchain and
+# langgraph have both shipped 1.x releases with breaking API changes, and this
+# project targets the 0.3.x / 0.6.x line pinned in uv.lock.
+groq>=0.31.0,<1.0
+langchain>=0.3.27,<0.4
+langchain-core>=0.3.72,<0.4
+langchain-groq>=0.3.7,<0.4
+langgraph>=0.6.3,<0.7
+pydantic>=2.11.7,<3.0
+python-dotenv>=1.1.1,<2.0
+streamlit>=1.30.0,<2.0
