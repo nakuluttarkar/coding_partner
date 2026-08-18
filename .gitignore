@@ -8,3 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Secrets — commit .env.example instead
+.env
+
+# Agent output
+generated_project/
