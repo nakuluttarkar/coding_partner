@@ -144,8 +144,20 @@ agent/
   utils.py     # model fallback + retry
 streamlit/
   app.py       # web UI
+tests/         # pytest suite (no API key required)
 main.py        # CLI entry point
 ```
+
+### Tests
+
+```bash
+uv run pytest
+```
+
+The suite covers the model fallback/retry logic, the path sandbox, and the coder
+loop. It needs no Groq key: `tests/conftest.py` sets a dummy one so the client can
+be constructed, and no test makes a real API call. CI runs it on every push and
+pull request (`.github/workflows/ci.yml`).
 
 ## License
 
