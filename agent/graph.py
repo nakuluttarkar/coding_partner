@@ -1,8 +1,7 @@
+from typing import Optional, TypedDict
+
 from langchain_groq import ChatGroq
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
-from langgraph.graph.message import add_messages
-from pydantic import BaseModel, Field, FileUrl
+from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import create_react_agent
 from .prompts import *
 from .states import *
@@ -13,6 +12,23 @@ from .utils import safe_invoke
 
 import os
 load_dotenv()
+
+if not os.getenv("GROQ_API_KEY"):
+    raise RuntimeError(
+        "GROQ_API_KEY is not set. Copy .env.example to .env and add a key from "
+        "https://console.groq.com/keys -- the Groq client is built at import "
+        "time, so this module cannot load without one."
+    )
+
+
+class AgentState(TypedDict, total=False):
+    """State passed between graph nodes. total=False since each node
+    contributes only its own keys."""
+    user_prompt: str
+    plan: Plan
+    task_plan: TaskPlan
+    coder_state: Optional[CoderState]
+    status: str
 
 # Groq fallback chain, best-first. Production models sit at the head AND tail so
 # the chain still works if the preview model in the middle is retired -- which is
@@ -32,10 +48,8 @@ FALLBACK_MODELS = [
     for model_id in FALLBACK_MODEL_IDS
 ]
 
-user_prompt = "Create a simple calculator web app using html, css, and javascript"
 
-
-def planner_agent(state: dict) -> dict:
+def planner_agent(state: AgentState) -> dict:
     print("\n ------- ENTERING PLANNER AGENT-------\n")
     user_prompt = state["user_prompt"]
     resp = safe_invoke(
@@ -46,7 +60,7 @@ def planner_agent(state: dict) -> dict:
     print(resp)
     return {"plan": resp}
 
-def architect_agent(state: dict) -> dict:
+def architect_agent(state: AgentState) -> dict:
     print("\n ------- ENTERING ARCHITECT AGENT-------\n")
     plan: Plan = state["plan"]
     resp = safe_invoke(
@@ -62,7 +76,7 @@ def architect_agent(state: dict) -> dict:
 
     return {"task_plan": resp}
 
-def coding_agent(state: dict) -> dict :
+def coding_agent(state: AgentState) -> dict:
     print("\n ------- ENTERING CODING AGENT-------\n")
     coder_state: CoderState = state.get("coder_state")
     if coder_state is None:
@@ -116,7 +130,7 @@ def coding_agent(state: dict) -> dict :
     
 
     
-graph = StateGraph(dict)
+graph = StateGraph(AgentState)
 graph.add_node("planner", planner_agent)
 graph.add_node("architect", architect_agent)
 graph.add_node("coder", coding_agent)
