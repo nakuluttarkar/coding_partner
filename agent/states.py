@@ -18,6 +18,16 @@ class ImplementationTask(BaseModel):
     task_description: str = Field(description="A detailed description of the task to be performed on the file, e.g. 'add user authentication', 'implement data processing logic', etc.")
 
 class TaskPlan(BaseModel):
+    shared_contract: str = Field(
+        default="",
+        description=(
+            "The CSS class names and element structure every file must agree on, "
+            "written ONCE. Include the exact class for each element and the state "
+            "classes (.hidden, .active, .open). This is injected into every "
+            "implementation task automatically, so do NOT repeat it in the task "
+            "descriptions."
+        ),
+    )
     implementation_steps: list[ImplementationTask] = Field(description="A list of steps to be taken to implement the task")
     # Attached by architect_agent after generation, not produced by the model.
     # SkipJsonSchema keeps it out of the function-calling schema so the model is

@@ -39,18 +39,28 @@ def architect_prompt(plan):
       result is a page whose CSS styles elements the HTML never creates.
 
     SHARED CLASS CONTRACT (important):
-    - Decide the CSS class names ONCE, list them explicitly, and repeat that list
-      verbatim in EVERY task description that touches markup, styles, or scripts.
-      Give the exact element structure too, for example:
-        header.app-header > h1.app-title, button.btn.theme-toggle
-        section.controls > input.input#search-input, div.category-filters
+    - Put the CSS class names and element structure in the `shared_contract`
+      field, ONCE. It is injected into every implementation task automatically,
+      so do NOT repeat it inside task descriptions -- repeating it makes this
+      response too long to generate and the whole plan fails. Keep it compact,
+      roughly 10-20 short lines, for example:
+        header.app-header > h1.app-title, button.theme-toggle
+        section.controls > input#search-input.input, div.category-filters
         div.recipe-card > div.card-body > h3.title, span.category-badge
-        .hidden  (sets display:none; used to conceal the modal and empty state)
-    - Every class used in markup or added by a script must appear in that list,
-      and the stylesheet task must define a rule for every class in it. State-
-      toggling classes count: '.hidden', '.active' and '.open' must be styled, or
-      hidden elements will stay on screen.
-    - Scripts that build DOM elements must use these exact class names.
+        .hidden  -> display:none
+        .active  -> highlighted filter button
+    - Every class used in markup or added by a script must appear there, and the
+      stylesheet task must define a rule for each one. State-toggling classes
+      count: '.hidden', '.active' and '.open' must be styled, or elements that
+      are supposed to disappear stay on screen.
+    - Task descriptions should then be SHORT: what this one file does, and
+      nothing that the contract already says.
+
+    SCRIPT LOADING:
+    - Use classic scripts: <script src="app.js" defer></script>. Never specify
+      type="module" or ES module import/export. Browsers block modules on
+      file:// URLs, so a module-based page is blank when opened from disk.
+      Share code between scripts by attaching to window instead.
 
     SIZE LIMIT (important):
     - Each task must produce a file of at most ~120 lines. The whole file is written

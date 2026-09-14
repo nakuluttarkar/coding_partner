@@ -116,8 +116,18 @@ def coding_agent(state: AgentState) -> dict:
     if len(existing_content) > MAX_EXISTING_CONTENT_CHARS:
         existing_content = existing_content[:MAX_EXISTING_CONTENT_CHARS] + "\n... (truncated)"
 
+    # Injected here rather than repeated by the architect in every task: making
+    # the model duplicate it across all descriptions blew the output token
+    # budget and failed the whole plan. Emitted once, delivered everywhere.
+    contract = getattr(coder_state.task_plan, "shared_contract", "") or ""
+    contract_block = (
+        f"Shared class/structure contract for the whole project -- use these exact "
+        f"names:\n{contract}\n\n" if contract.strip() else ""
+    )
+
     system_prompt = coder_prompt()
     user_prompt = (
+        f"{contract_block}"
         f"Task: {current_task.task_description}\n"
         f"File: {current_task.filepath}\n"
         f"Existing Content: \n{existing_content}\n"

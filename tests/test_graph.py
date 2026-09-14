@@ -148,3 +148,46 @@ def test_verifier_is_quiet_on_a_complete_project(tmp_path, monkeypatch):
 def test_graph_routes_through_the_verifier_before_finishing():
     nodes = set(g.agent.get_graph().nodes)
     assert "verifier" in nodes
+
+
+# --- shared class contract ---------------------------------------------------
+# Making the architect repeat the contract in every task description blew the
+# output token budget and failed the whole plan. It is emitted once and injected
+# into each coder prompt here instead.
+
+def test_shared_contract_is_injected_into_the_coder_prompt(monkeypatch, no_disk_reads):
+    captured = {}
+
+    class Capturing:
+        def invoke(self, payload, *a, **k):
+            captured["user"] = payload["messages"][1]["content"]
+            return {"messages": []}
+
+    monkeypatch.setattr(g, "create_react_agent", lambda model, tools: Capturing())
+    tp = _task_plan("index.html")
+    tp.shared_contract = ".hidden -> display:none\n.recipe-card > .title"
+    g.coding_agent({"task_plan": tp})
+
+    assert ".hidden -> display:none" in captured["user"]
+    assert "Shared class/structure contract" in captured["user"]
+
+
+def test_coder_prompt_omits_the_contract_block_when_empty(monkeypatch, no_disk_reads):
+    captured = {}
+
+    class Capturing:
+        def invoke(self, payload, *a, **k):
+            captured["user"] = payload["messages"][1]["content"]
+            return {"messages": []}
+
+    monkeypatch.setattr(g, "create_react_agent", lambda model, tools: Capturing())
+    g.coding_agent({"task_plan": _task_plan("index.html")})
+    assert "Shared class/structure contract" not in captured["user"]
+    assert captured["user"].startswith("Task:")
+
+
+def test_shared_contract_is_not_exposed_to_the_llm_as_a_hidden_field():
+    """It must be a real schema field -- the architect has to fill it in."""
+    props = TaskPlan.model_json_schema()["properties"]
+    assert "shared_contract" in props
+    assert "plan" not in props
