@@ -6,7 +6,8 @@ from langgraph.prebuilt import create_react_agent
 from .prompts import *
 from .states import *
 from agent.tools import (
-    write_file, read_file, get_current_directory, list_files, GENERATED_PROJECT_ROOT,
+    write_file, read_file, get_current_directory, list_files,
+    GENERATED_PROJECT_ROOT, clear_project_root,
 )
 from agent.verify import find_problems
 from dotenv import load_dotenv
@@ -70,6 +71,11 @@ class AgentState(TypedDict, total=False):
 
 def planner_agent(state: AgentState) -> dict:
     console("\n ------- ENTERING PLANNER AGENT-------\n")
+    # Clear here rather than in a caller: the planner runs exactly once per run,
+    # so every entry point (CLI and UI alike) starts from an empty directory.
+    # Without this a run only overwrites colliding filenames and ships the
+    # previous project's leftovers inside this project's download.
+    clear_project_root()
     user_prompt = state["user_prompt"]
     resp = safe_invoke(
         FALLBACK_MODELS,

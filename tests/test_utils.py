@@ -156,3 +156,24 @@ def test_console_survives_a_non_utf8_stdout(monkeypatch, capsys):
 def test_console_passes_ascii_through_unchanged(capsys):
     utils.console("[MODEL] plain ascii")
     assert capsys.readouterr().out.strip() == "[MODEL] plain ascii"
+
+
+def test_backoff_parses_millisecond_waits():
+    """Groq reports sub-second waits in ms ("Please try again in 975ms"). Missing
+    that unit turned a 1-second wait into a 20-second backoff -- observed live."""
+    exc = Exception("Rate limit reached ... Please try again in 975ms")
+    assert utils.backoff_seconds(exc, attempt=0) == pytest.approx(1.975)
+
+
+def test_backoff_still_parses_second_waits():
+    exc = Exception("Rate limit reached ... Please try again in 7.482s")
+    assert utils.backoff_seconds(exc, attempt=0) == pytest.approx(8.482)
+
+
+def test_real_tpm_error_from_a_live_run_is_retryable():
+    """Verbatim from the recipe-app run's README step."""
+    live = ("Error code: 429 - {'error': {'message': 'Rate limit reached for model "
+            "`openai/gpt-oss-120b` ... on tokens per minute (TPM): Limit 8000, Used 4541, "
+            "Requested 3589. Please try again in 975ms.', 'code': 'rate_limit_exceeded'}}")
+    assert utils.is_rate_limited(Exception(live))
+    assert utils.backoff_seconds(Exception(live), 0) == pytest.approx(1.975)

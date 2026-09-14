@@ -74,3 +74,36 @@ def test_project_with_no_html_is_not_a_problem(tmp_path):
 
 def test_missing_directory_is_reported(tmp_path):
     assert find_problems(tmp_path / "nope") != []
+
+
+# --- assets referenced from code, not markup ---------------------------------
+# A live run produced recipe cards whose images came from seed data in a .js
+# file. The HTML was clean, the verifier passed, and every image 404'd.
+
+def test_missing_image_referenced_from_javascript_is_reported(tmp_path):
+    write(tmp_path, "index.html", '<div id="app"></div>')
+    write(tmp_path, "storage.js", 'const seed=[{title:"Pasta",image:"spaghetti.jpg"}];')
+    problems = find_problems(tmp_path)
+    assert any("spaghetti.jpg" in p for p in problems)
+    assert any("storage.js" in p for p in problems)
+
+
+def test_missing_asset_referenced_from_css_is_reported(tmp_path):
+    write(tmp_path, "style.css", 'body { background: url("bg.png"); }')
+    assert any("bg.png" in p for p in find_problems(tmp_path))
+
+
+def test_existing_asset_referenced_from_javascript_is_fine(tmp_path):
+    write(tmp_path, "app.js", 'const icon = "icon.svg";')
+    write(tmp_path, "icon.svg", "<svg></svg>")
+    assert find_problems(tmp_path) == []
+
+
+def test_external_asset_urls_in_code_are_ignored(tmp_path):
+    write(tmp_path, "app.js", 'const img = "https://cdn.example.com/a.png";')
+    assert find_problems(tmp_path) == []
+
+
+def test_each_missing_asset_is_reported_once(tmp_path):
+    write(tmp_path, "app.js", 'const a="x.jpg"; const b="x.jpg"; const c="x.jpg";')
+    assert len([p for p in find_problems(tmp_path) if "x.jpg" in p]) == 1

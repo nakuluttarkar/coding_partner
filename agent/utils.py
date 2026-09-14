@@ -9,8 +9,11 @@ import time
 # sends it as 413 as well as 429 depending on which limit was hit.
 _RATE_LIMIT_MARKERS = ("rate_limit", "429", "413", "too many requests", "request too large")
 
-# Groq often says how long to wait, e.g. "Please try again in 7.482s".
-_RETRY_AFTER_RE = re.compile(r"try again in\s+([0-9]+(?:\.[0-9]+)?)\s*s", re.IGNORECASE)
+# Groq often says how long to wait. The unit varies with the size of the wait:
+# "Please try again in 7.482s" but "Please try again in 975ms" for sub-second
+# waits, so both have to be parsed or a 1s wait becomes a full backoff.
+_RETRY_AFTER_RE = re.compile(
+    r"try again in\s+([0-9]+(?:\.[0-9]+)?)\s*(ms|s)\b", re.IGNORECASE)
 
 # Per-minute windows reset after 60s, so back off in that ballpark rather than
 # hammering a limit that has not cleared yet.
@@ -48,7 +51,11 @@ def backoff_seconds(exc, attempt: int) -> float:
     """Honour the wait Groq asks for, else exponential backoff within the cap."""
     match = _RETRY_AFTER_RE.search(str(exc))
     if match:
-        return min(float(match.group(1)) + 1.0, _BACKOFF_CAP_SECONDS)
+        wait = float(match.group(1))
+        if match.group(2).lower() == "ms":
+            wait /= 1000.0
+        # Small buffer so the window has definitely rolled over.
+        return min(wait + 1.0, _BACKOFF_CAP_SECONDS)
     return min(_BACKOFF_BASE_SECONDS * (2 ** attempt), _BACKOFF_CAP_SECONDS)
 
 

@@ -21,7 +21,7 @@ except RuntimeError as exc:
 
 from agent.bundle import find_entry_html, inline_html
 from agent.tools import (
-    GENERATED_PROJECT_ROOT, clear_project_root, init_project_root, list_files, read_file,
+    GENERATED_PROJECT_ROOT, init_project_root, list_files, read_file,
 )
 
 init_project_root()
@@ -36,10 +36,6 @@ if st.button("Generate Project"):
         st.error("Please enter a project prompt")
     else:
         try:
-            # Wipe first. Without this a run only overwrites colliding filenames,
-            # so a previous project's files ship inside this project's download.
-            clear_project_root()
-
             # stream() rather than invoke() so each agent reports as it finishes,
             # instead of the user staring at one spinner for several minutes.
             with st.status("Generating project...", expanded=True) as status:
@@ -158,9 +154,21 @@ else:
                     file_name="index.html",
                     mime="text/html",
                 )
-                st.caption(
-                    "One self-contained file with the CSS and JavaScript inlined. "
-                    "Works anywhere, with nothing to extract."
-                )
+                other_pages = [p for p in generated_files
+                               if p.suffix.lower() == ".html" and p != entry]
+                if other_pages:
+                    # Links to sibling pages cannot be inlined, so say so rather
+                    # than hand over a file whose navigation quietly 404s.
+                    st.caption(
+                        f"Entry page only, with CSS and JavaScript inlined. This project "
+                        f"has {len(other_pages)} other page(s) "
+                        f"({', '.join(p.name for p in other_pages)}); links to them will "
+                        f"not work in the standalone file. Use the ZIP for the full app."
+                    )
+                else:
+                    st.caption(
+                        "One self-contained file with the CSS and JavaScript inlined. "
+                        "Works anywhere, with nothing to extract."
+                    )
             except Exception as e:
                 st.caption(f"Standalone build unavailable: {e}")

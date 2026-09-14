@@ -40,6 +40,10 @@ def architect_prompt(plan):
     - Every path referenced from HTML (stylesheet href, script src, image src) must
       correspond to a file that another task in this plan creates, at a matching
       relative path. Do not reference a file that no task produces.
+    - NEVER reference a binary image file (.jpg, .png, .gif, .webp) from markup,
+      from CSS, or from seed data in JavaScript. Only text files can be created,
+      so every such reference is a guaranteed broken image. Use an inline SVG, a
+      CSS gradient or colour block, or an emoji character instead.
 
     DOCUMENTATION:
     - Add a README.md task. It must describe THIS project specifically: the same
@@ -76,6 +80,9 @@ def coder_prompt():
     - Reference sibling files by plain relative path ("style.css", not "/style.css"
       and not "./assets/../style.css").
     - Only reference files that exist or that the plan creates.
+    - Never point at a binary image (.jpg, .png, .gif, .webp), including in sample
+      or seed data. You can only write text, so such a file will never exist and
+      the image will render broken. Use inline SVG, a CSS gradient, or an emoji.
 
     Static sites must work when opened directly from disk:
     - Use a classic script tag: <script src="script.js" defer></script>.
