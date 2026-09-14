@@ -33,11 +33,14 @@ The coder is a ReAct agent with four sandboxed tools (`read_file`, `write_file`,
 
 Every agent tries three Groq models in order, falling back to the next on failure:
 
-| # | Model | Status | Context |
+| # | Model | Context | Max output |
 |---|---|---|---|
-| 1 | `openai/gpt-oss-120b` | production | 131K |
-| 2 | `qwen/qwen3.6-27b` | preview | 131K |
-| 3 | `openai/gpt-oss-20b` | production | 131K |
+| 1 | `openai/gpt-oss-120b` | 131K | 64K |
+| 2 | `qwen/qwen3.8-27b` | 131K | 16K |
+| 3 | `openai/gpt-oss-20b` | 131K | 64K |
+
+The coder uses the same models in a different order (`CODER_MODEL_IDS`), since
+it writes a whole file per call and needs output headroom.
 
 The chain is defined once as `FALLBACK_MODEL_IDS` in `agent/graph.py`. Production models sit
 at both the head and the tail deliberately: preview models can be retired at short notice, so
@@ -45,10 +48,14 @@ the chain stays functional even if the middle entry disappears. Groq publishes r
 [console.groq.com/docs/deprecations](https://console.groq.com/docs/deprecations) — worth a
 glance if runs start failing.
 
-If generated files outgrow the 131K window, swap the middle entry for `minimaxai/minimax-m2.7`
-(196K context, also preview). Avoid `groq/compound` and `groq/compound-mini` here: they
+`qwen/qwen3.6-27b` was removed: on the free tier it caps output at 1,000 tokens/minute and
+refuses any request expecting more, which a stylesheet or a task plan exceeds on its own.
+`qwen/qwen3.8-27b` has no such cap. Avoid `groq/compound` and `groq/compound-mini`: they
 orchestrate their own built-in tools server-side and don't support the local tool-calling this
-project relies on.
+project relies on. `allam-2-7b` has only a 4K context.
+
+Check what your account can actually reach with `client.models.list()` rather than the docs --
+model availability differs per account.
 
 The planner and architect go through `safe_invoke` in `agent/utils.py`, which additionally
 retries a rate-limited model in place with exponential backoff before moving on. The coder
@@ -124,11 +131,14 @@ python main.py --recursion-limit 200
 
 ## Output
 
-Everything is written to `generated_project/` in the repo root. This directory is gitignored.
+Everything is written to `generated_project/` in the repo root. This directory is gitignored
+and **cleared at the start of every run**, so a project never ships with leftovers from the
+previous one. Copy anything you want to keep before regenerating.
 
-Note that it is **not cleared between runs**: a new run overwrites files whose names collide
-but leaves everything else in place, so output from a previous project can linger and end up
-in your ZIP download. Delete the directory between unrelated prompts.
+Two downloads are offered. The ZIP holds the real project — extract it fully before opening
+`index.html`, since opening it from inside an archive viewer loads the page without its CSS or
+JavaScript. The standalone HTML inlines the CSS and JavaScript into one file that works
+anywhere, but only covers the entry page; links to other pages won't resolve.
 
 ## Development
 

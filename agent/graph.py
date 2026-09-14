@@ -32,18 +32,20 @@ if not os.getenv("GROQ_API_KEY"):
 # For projects whose files outgrow the 131K window, swap the middle entry for
 # "minimaxai/minimax-m2.7" (196K context, also preview).
 FALLBACK_MODEL_IDS = [
-    "openai/gpt-oss-120b",  # production, 131K ctx -- flagship
-    "qwen/qwen3.6-27b",     # preview,    131K ctx -- Groq's recommended scout replacement
-    "openai/gpt-oss-20b",   # production, 131K ctx -- fastest, guaranteed floor
+    "openai/gpt-oss-120b",  # 131K ctx, 64K max out -- the only reliable architect
+    "qwen/qwen3.8-27b",     # 131K ctx, 16K max out -- no output cap, unlike 3.6
+    "openai/gpt-oss-20b",   # 131K ctx, 64K max out -- fastest, guaranteed floor
 ]
 
-# The coder writes a whole file in one tool call, so it needs output headroom.
-# qwen/qwen3.6-27b is excluded: its free-tier output cap is 1,000 tokens/min,
-# which a stylesheet exceeds on its own (observed: "OTPM Limit 1000, Requested
-# 1064"). It stays in the chain above, where responses are far smaller.
+# qwen/qwen3.6-27b was removed from both chains: its free-tier output cap is
+# 1,000 tokens/min, so it refused any request expecting more (observed "OTPM
+# Limit 1000, Requested 1064" on a stylesheet and "Requested 2048" on a plan).
+# qwen/qwen3.8-27b has no such cap -- measured by asking each for max_tokens=2048,
+# which 3.6 rejects and 3.8 accepts -- so it replaces 3.6 and can also code.
 CODER_MODEL_IDS = [
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
+    "qwen/qwen3.8-27b",
 ]
 
 # Injecting a large existing file doubles input tokens against an 8K/min budget.

@@ -100,11 +100,18 @@ def test_task_plan_hides_attached_plan_from_the_llm_schema():
     assert "plan" not in TaskPlan.model_json_schema()["properties"]
 
 
-def test_coder_chain_excludes_the_low_output_cap_model():
-    """qwen/qwen3.6-27b has a 1,000 output-token/min free-tier cap; a stylesheet
-    exceeds it on its own, so the coder must not fall back to it."""
+def test_output_capped_model_is_not_used_anywhere():
+    """qwen/qwen3.6-27b refuses any request expecting over 1,000 output tokens on
+    the free tier, which both a stylesheet and a task plan exceed."""
     assert "qwen/qwen3.6-27b" not in g.CODER_MODEL_IDS
-    assert "qwen/qwen3.6-27b" in g.FALLBACK_MODEL_IDS
+    assert "qwen/qwen3.6-27b" not in g.FALLBACK_MODEL_IDS
+
+
+def test_the_reliable_architect_model_leads_every_chain():
+    """gpt-oss-120b is the only model that handled the architect's nested
+    function-calling schema reliably, so it must be tried first."""
+    assert g.FALLBACK_MODEL_IDS[0] == "openai/gpt-oss-120b"
+    assert g.CODER_MODEL_IDS[0] == "openai/gpt-oss-120b"
 
 
 def test_coder_retries_a_rate_limited_model_instead_of_giving_up(monkeypatch, no_disk_reads):
