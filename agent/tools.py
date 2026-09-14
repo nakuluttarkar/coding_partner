@@ -1,4 +1,5 @@
 import pathlib
+import shutil
 
 from langchain_core.tools import tool
 
@@ -60,5 +61,18 @@ def list_files(directory: str = ".") -> str:
 
 
 def init_project_root():
+    GENERATED_PROJECT_ROOT.mkdir(parents=True, exist_ok=True)
+    return str(GENERATED_PROJECT_ROOT)
+
+
+def clear_project_root():
+    """Empty the generated project before a new run.
+
+    Without this, a run only overwrites files whose names collide, so leftovers
+    from an earlier project ship inside the next download -- which is how a
+    calculator ended up packaged with a todo app's README.
+    """
+    if GENERATED_PROJECT_ROOT.exists():
+        shutil.rmtree(GENERATED_PROJECT_ROOT)
     GENERATED_PROJECT_ROOT.mkdir(parents=True, exist_ok=True)
     return str(GENERATED_PROJECT_ROOT)

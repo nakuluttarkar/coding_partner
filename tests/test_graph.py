@@ -7,6 +7,7 @@ that was never fully written.
 import pytest
 
 from agent import graph as g
+from agent import utils
 from agent.states import CoderState, ImplementationTask, TaskPlan
 
 
@@ -44,7 +45,7 @@ def no_disk_reads(monkeypatch):
 
 def test_graph_compiles_and_exposes_expected_state_keys():
     assert set(g.AgentState.__annotations__) == {
-        "user_prompt", "plan", "task_plan", "coder_state", "status"
+        "user_prompt", "plan", "task_plan", "coder_state", "status", "problems"
     }
     assert g.agent is not None
 
@@ -89,7 +90,7 @@ def test_coder_error_names_every_attempted_model(monkeypatch, no_disk_reads):
     monkeypatch.setattr(g, "create_react_agent", lambda model, tools: _StubAgent(fail=True))
     with pytest.raises(RuntimeError) as exc:
         g.coding_agent({"task_plan": _task_plan("a.txt")})
-    for model_id in g.FALLBACK_MODEL_IDS:
+    for model_id in g.CODER_MODEL_IDS:
         assert model_id in str(exc.value)
 
 
@@ -97,3 +98,53 @@ def test_task_plan_hides_attached_plan_from_the_llm_schema():
     # `plan` is attached by architect_agent after generation; exposing it in the
     # function-calling schema would ask the model to fill in the whole plan again.
     assert "plan" not in TaskPlan.model_json_schema()["properties"]
+
+
+def test_coder_chain_excludes_the_low_output_cap_model():
+    """qwen/qwen3.6-27b has a 1,000 output-token/min free-tier cap; a stylesheet
+    exceeds it on its own, so the coder must not fall back to it."""
+    assert "qwen/qwen3.6-27b" not in g.CODER_MODEL_IDS
+    assert "qwen/qwen3.6-27b" in g.FALLBACK_MODEL_IDS
+
+
+def test_coder_retries_a_rate_limited_model_instead_of_giving_up(monkeypatch, no_disk_reads):
+    """A 413 TPM error clears within the minute; the old loop gave up on it and
+    failed a run that would have succeeded on retry."""
+    monkeypatch.setattr(utils.time, "sleep", lambda s: None)
+
+    class Flaky:
+        def __init__(self):
+            self.n = 0
+
+        def invoke(self, *a, **k):
+            self.n += 1
+            if self.n == 1:
+                raise RuntimeError("Error code: 413 ... 'code': 'rate_limit_exceeded'")
+            return {"messages": []}
+
+    flaky = Flaky()
+    monkeypatch.setattr(g, "create_react_agent", lambda model, tools: flaky)
+    result = g.coding_agent({"task_plan": _task_plan("style.css")})
+    assert flaky.n == 2, "should retry the rate-limited model in place"
+    assert result["coder_state"].current_step_idx == 1
+
+
+def test_verifier_reports_a_missing_stylesheet(tmp_path, monkeypatch):
+    (tmp_path / "index.html").write_text(
+        '<link rel="stylesheet" href="style.css">', encoding="utf-8")
+    monkeypatch.setattr(g, "GENERATED_PROJECT_ROOT", tmp_path)
+    problems = g.verifier_agent({})["problems"]
+    assert len(problems) == 1 and "style.css" in problems[0]
+
+
+def test_verifier_is_quiet_on_a_complete_project(tmp_path, monkeypatch):
+    (tmp_path / "index.html").write_text(
+        '<link rel="stylesheet" href="style.css">', encoding="utf-8")
+    (tmp_path / "style.css").write_text("body{}", encoding="utf-8")
+    monkeypatch.setattr(g, "GENERATED_PROJECT_ROOT", tmp_path)
+    assert g.verifier_agent({})["problems"] == []
+
+
+def test_graph_routes_through_the_verifier_before_finishing():
+    nodes = set(g.agent.get_graph().nodes)
+    assert "verifier" in nodes

@@ -45,7 +45,7 @@ def test_rate_limited_model_is_retried_in_place(sleeps):
     assert utils.safe_invoke([m1, m2], prompt="x") == "m1-ok"
     assert m1.calls == 2, "rate-limited model should be retried, not skipped"
     assert m2.calls == 0, "should not fall back when the retry succeeds"
-    assert sleeps == [10]
+    assert sleeps == [20], "backoff should match Groq's 60s per-minute window"
 
 
 def test_non_rate_limit_error_falls_through_without_sleeping(sleeps):
@@ -61,7 +61,7 @@ def test_retries_argument_is_honoured(sleeps):
     with pytest.raises(RuntimeError):
         utils.safe_invoke([m1], prompt="x", retries=2)
     assert m1.calls == 3, "retries=2 means 3 total attempts"
-    assert sleeps == [10, 20], "exponential backoff, and no sleep before raising"
+    assert sleeps == [20, 40], "exponential backoff, and no sleep before raising"
 
 
 def test_exhausting_all_models_raises_with_causes(sleeps):
@@ -82,3 +82,77 @@ def test_structured_output_path_is_used_when_requested(sleeps):
     assert utils.safe_invoke([m], structured_output=dict, method="function_calling",
                              prompt="x") == "structured-ok"
     assert m.method == "function_calling"
+
+
+# --- rate-limit classification and backoff -----------------------------------
+# Real Groq free-tier failures: TPM exceeded arrives as 413, OTPM as 429, and a
+# file too large to write arrives as a 400 with unparseable tool-call JSON.
+
+TPM_413 = ("Error code: 413 - Request too large for model openai/gpt-oss-120b on tokens "
+           "per minute (TPM): Limit 8000, Requested 8122 ... 'code': 'rate_limit_exceeded'")
+OTPM_429 = ("Error code: 429 - Request too large for model qwen/qwen3.6-27b on output tokens "
+            "per minute (OTPM): Limit 1000, Requested 1064 ... 'code': 'rate_limit_exceeded'")
+TRUNCATED_400 = ("Error code: 400 - Failed to parse tool call arguments as JSON, "
+                 "'code': 'tool_use_failed'")
+
+
+@pytest.mark.parametrize("message", [TPM_413, OTPM_429, "429 Too Many Requests"])
+def test_rate_limit_classification(message):
+    assert utils.is_rate_limited(Exception(message))
+
+
+def test_truncated_tool_call_is_not_treated_as_a_rate_limit():
+    exc = Exception(TRUNCATED_400)
+    assert utils.is_output_truncated(exc)
+    assert not utils.is_rate_limited(exc)
+
+
+def test_backoff_honours_the_wait_groq_asks_for():
+    exc = Exception("Rate limit reached. Please try again in 7.482s")
+    assert utils.backoff_seconds(exc, attempt=0) == pytest.approx(8.482)
+
+
+def test_backoff_is_capped():
+    assert utils.backoff_seconds(Exception("429"), attempt=10) == 60
+
+
+def test_tpm_failure_is_retried_in_place(sleeps):
+    m1 = FakeModel("m1", [Exception(TPM_413)])
+    m2 = FakeModel("m2")
+    assert utils.safe_invoke([m1, m2], prompt="x") == "m1-ok"
+    assert m1.calls == 2, "a 413 TPM error clears on its own and must be retried"
+    assert m2.calls == 0
+
+
+def test_error_explains_truncation_when_a_tool_call_was_cut_off(sleeps):
+    m1 = FakeModel("m1", [Exception(TRUNCATED_400)])
+    with pytest.raises(RuntimeError, match="too large to write in a single call"):
+        utils.safe_invoke([m1], prompt="x", retries=0)
+
+
+def test_error_explains_free_tier_limits_when_rate_limited(sleeps):
+    m1 = FakeModel("m1", [Exception(TPM_413)])
+    with pytest.raises(RuntimeError, match="free-tier per-minute limits"):
+        utils.safe_invoke([m1], prompt="x", retries=0)
+
+
+def test_console_survives_a_non_utf8_stdout(monkeypatch, capsys):
+    """Reproduces the Windows cp1252 crash: printing non-ASCII must not raise."""
+    real_print = print
+
+    def cp1252_print(msg):
+        # Mimics a console that rejects anything outside cp1252.
+        str(msg).encode("cp1252")
+        real_print(msg)
+
+    monkeypatch.setattr("builtins.print", cp1252_print)
+    utils.console("done ← arrow")   # left-arrow: not encodable in cp1252
+    monkeypatch.undo()
+
+    out = capsys.readouterr().out
+    assert "done" in out and "arrow" in out, "message should still reach the console"
+
+
+def test_console_passes_ascii_through_unchanged(capsys):
+    utils.console("[MODEL] plain ascii")
+    assert capsys.readouterr().out.strip() == "[MODEL] plain ascii"
