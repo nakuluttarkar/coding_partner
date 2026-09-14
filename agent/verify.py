@@ -21,6 +21,22 @@ _ASSET_IN_CODE_RE = re.compile(
 )
 _CODE_SUFFIXES = (".js", ".css")
 
+# Class names, for catching markup and stylesheet that drifted apart. Each file
+# is generated in its own task, so nothing forces them to agree on a vocabulary
+# -- and when the architect orders the stylesheet before the markup, the CSS is
+# written for a DOM that does not exist yet.
+_CLASS_ATTR_RE = re.compile(r"""\bclass\s*=\s*["']([^"']*)["']""", re.IGNORECASE)
+_CSS_CLASS_DEF_RE = re.compile(r"\.(-?[A-Za-z_][\w-]*)")
+_STYLE_BLOCK_RE = re.compile(r"<style[^>]*>(.*?)</style>", re.IGNORECASE | re.DOTALL)
+# Classes a script attaches at runtime: classList.add('x'), className = 'x y'.
+_JS_CLASSLIST_RE = re.compile(
+    r"""classList\s*\.\s*(?:add|remove|toggle|contains)\s*\(\s*["']([^"']+)["']""")
+_JS_CLASSNAME_RE = re.compile(r"""\.className\s*=\s*["']([^"']*)["']""")
+
+# Classes that are conventionally behavioural rather than styled, or that come
+# from outside the project; flagging them would be noise.
+_IGNORED_CLASSES = frozenset({"js", "no-js"})
+
 # References that do not point at a file in the project.
 _EXTERNAL_PREFIXES = ("http://", "https://", "//", "data:", "mailto:", "tel:", "javascript:", "#")
 
@@ -71,7 +87,72 @@ def find_problems(project_root) -> list[str]:
             )
 
     problems.extend(_find_missing_assets_in_code(root))
+    problems.extend(_find_unstyled_classes(root))
     return problems
+
+
+def _collect_defined_classes(root: Path) -> set:
+    """Class names that some stylesheet (or inline <style>) actually styles."""
+    defined = set()
+    for css_file in sorted(root.rglob("*.css")):
+        try:
+            defined.update(_CSS_CLASS_DEF_RE.findall(css_file.read_text(encoding="utf-8")))
+        except (OSError, UnicodeDecodeError):
+            continue
+    for html_file in sorted(root.rglob("*.html")):
+        try:
+            text = html_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for block in _STYLE_BLOCK_RE.findall(text):
+            defined.update(_CSS_CLASS_DEF_RE.findall(block))
+    return defined
+
+
+def _find_unstyled_classes(root: Path) -> list[str]:
+    """Report classes the markup or scripts apply that no stylesheet defines.
+
+    This is the failure that leaves a generated app looking broken while every
+    file reference is valid: a `hidden` class used to conceal a modal, which no
+    rule defines, so the modal is simply always on screen.
+    """
+    defined = _collect_defined_classes(root)
+    used = {}  # class -> file that first uses it
+
+    def record(name, origin):
+        name = name.strip()
+        if name and name not in _IGNORED_CLASSES and name not in used:
+            used[name] = origin
+
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in (".html", ".js"):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        origin = path.relative_to(root).as_posix()
+        # class="a b" appears in markup and in HTML strings built by scripts.
+        for attr in _CLASS_ATTR_RE.findall(text):
+            for name in attr.split():
+                record(name, origin)
+        if path.suffix.lower() == ".js":
+            for name in _JS_CLASSLIST_RE.findall(text):
+                record(name, origin)
+            for attr in _JS_CLASSNAME_RE.findall(text):
+                for name in attr.split():
+                    record(name, origin)
+
+    missing = sorted(name for name in used if name not in defined)
+    if not missing:
+        return []
+    shown = ", ".join(f"'{n}' ({used[n]})" for n in missing[:6])
+    more = f" and {len(missing) - 6} more" if len(missing) > 6 else ""
+    return [
+        f"{len(missing)} class(es) are applied but no stylesheet defines them: "
+        f"{shown}{more}. The markup and the stylesheet disagree, so the page will "
+        f"render unstyled or with elements that should be hidden left visible."
+    ]
 
 
 def _find_missing_assets_in_code(root: Path) -> list[str]:

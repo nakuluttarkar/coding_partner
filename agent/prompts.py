@@ -27,8 +27,30 @@ def architect_prompt(plan):
         * Name the variables and functions and classes and other components
         * Mention how this task depends on or how it will be used by other tasks
         * Include integration details: imports, expected function signatures, etc.
-    - Order tasks based on dependencies.
     - Each task should be self-contained, but also carry FORWARD the relevant context from earlier tasks.
+
+    TASK ORDER (important):
+    - Order tasks so that a file is written only after everything it must agree
+      with already exists. For a web project that means:
+        1. HTML markup first.
+        2. Stylesheets second, styling the markup written in step 1.
+        3. Scripts last, against the markup from step 1.
+      A stylesheet written before its markup is guessing at class names, and the
+      result is a page whose CSS styles elements the HTML never creates.
+
+    SHARED CLASS CONTRACT (important):
+    - Decide the CSS class names ONCE, list them explicitly, and repeat that list
+      verbatim in EVERY task description that touches markup, styles, or scripts.
+      Give the exact element structure too, for example:
+        header.app-header > h1.app-title, button.btn.theme-toggle
+        section.controls > input.input#search-input, div.category-filters
+        div.recipe-card > div.card-body > h3.title, span.category-badge
+        .hidden  (sets display:none; used to conceal the modal and empty state)
+    - Every class used in markup or added by a script must appear in that list,
+      and the stylesheet task must define a rule for every class in it. State-
+      toggling classes count: '.hidden', '.active' and '.open' must be styled, or
+      hidden elements will stay on screen.
+    - Scripts that build DOM elements must use these exact class names.
 
     SIZE LIMIT (important):
     - Each task must produce a file of at most ~120 lines. The whole file is written
@@ -75,6 +97,19 @@ def coder_prompt():
     - Implement the FULL file content, integrating with other modules.
     - Maintain consistent naming of variables, functions, and imports.
     - When a module is imported from another file, ensure it exists and is implemented as described.
+
+    Before writing a STYLESHEET:
+    - Use list_files and read_file to read every HTML file that already exists,
+      and write rules for the classes those files actually use. Do not invent a
+      different set of class names -- a rule for a class the markup never applies
+      styles nothing, and a class the markup uses with no rule renders unstyled.
+    - Always define the state classes the scripts toggle: '.hidden' must set
+      display:none, and '.active'/'.open' must have visible styling. A missing
+      '.hidden' rule leaves modals and empty-state messages permanently on screen.
+
+    Before writing a SCRIPT that creates DOM elements:
+    - Read the existing HTML and CSS, and reuse those exact class names on the
+      elements you build.
 
     File references:
     - Reference sibling files by plain relative path ("style.css", not "/style.css"

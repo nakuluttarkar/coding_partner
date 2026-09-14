@@ -107,3 +107,59 @@ def test_external_asset_urls_in_code_are_ignored(tmp_path):
 def test_each_missing_asset_is_reported_once(tmp_path):
     write(tmp_path, "app.js", 'const a="x.jpg"; const b="x.jpg"; const c="x.jpg";')
     assert len([p for p in find_problems(tmp_path) if "x.jpg" in p]) == 1
+
+
+# --- markup / stylesheet drift ----------------------------------------------
+# A live run ordered base.css before index.html, so the stylesheet was written
+# for a DOM that did not exist. Ten classes were applied with no rule defining
+# them, including `hidden` -- leaving the modal and empty state always visible
+# while every file reference was perfectly valid.
+
+def test_class_used_in_markup_without_a_rule_is_reported(tmp_path):
+    write(tmp_path, "index.html", '<div class="app-header">x</div>')
+    write(tmp_path, "style.css", ".recipe-card { color: red; }")
+    problems = find_problems(tmp_path)
+    assert any("app-header" in p for p in problems)
+
+
+def test_missing_hidden_rule_is_reported(tmp_path):
+    write(tmp_path, "index.html", '<div id="modal" class="modal hidden">x</div>')
+    write(tmp_path, "style.css", ".modal { position: fixed; }")
+    assert any("'hidden'" in p for p in find_problems(tmp_path))
+
+
+def test_classes_added_by_scripts_are_checked(tmp_path):
+    write(tmp_path, "index.html", "<div id=app></div>")
+    write(tmp_path, "app.js", "el.classList.add('active');")
+    write(tmp_path, "style.css", "#app { color: red; }")
+    assert any("active" in p for p in find_problems(tmp_path))
+
+
+def test_classname_assignment_in_scripts_is_checked(tmp_path):
+    write(tmp_path, "index.html", "<div id=app></div>")
+    write(tmp_path, "app.js", "card.className = 'recipe-card';")
+    write(tmp_path, "style.css", "#app{}")
+    assert any("recipe-card" in p for p in find_problems(tmp_path))
+
+
+def test_matching_markup_and_stylesheet_is_clean(tmp_path):
+    write(tmp_path, "index.html",
+          '<div class="app-header"><span class="title">x</span></div>')
+    write(tmp_path, "app.js", "el.classList.add('hidden');")
+    write(tmp_path, "style.css",
+          ".app-header{} .title{} .hidden{display:none}")
+    assert find_problems(tmp_path) == []
+
+
+def test_inline_style_block_counts_as_defining_classes(tmp_path):
+    """The standalone bundle inlines CSS into <style>, which must still count."""
+    write(tmp_path, "index.html",
+          '<style>.app-header{color:red}</style><div class="app-header">x</div>')
+    assert find_problems(tmp_path) == []
+
+
+def test_classes_defined_but_unused_are_not_reported(tmp_path):
+    """Dead CSS is untidy, not broken -- only the reverse direction breaks a page."""
+    write(tmp_path, "index.html", '<div class="used">x</div>')
+    write(tmp_path, "style.css", ".used{} .never-used{} .also-unused{}")
+    assert find_problems(tmp_path) == []
