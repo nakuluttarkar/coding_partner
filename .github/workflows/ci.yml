@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      # No GROQ_API_KEY secret needed: tests/conftest.py sets a dummy key so the
+      # Groq client can be constructed, and no test makes a real API call.
+      - name: Run tests
+        run: uv run pytest -q

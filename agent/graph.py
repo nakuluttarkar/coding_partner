@@ -1,8 +1,7 @@
+from typing import Optional, TypedDict
+
 from langchain_groq import ChatGroq
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
-from langgraph.graph.message import add_messages
-from pydantic import BaseModel, Field, FileUrl
+from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import create_react_agent
 from .prompts import *
 from .states import *
@@ -14,29 +13,58 @@ from .utils import safe_invoke
 import os
 load_dotenv()
 
-groq_model_gpt_20b = ChatGroq(model="openai/gpt-oss-20b", api_key=os.getenv("GROQ_API_KEY"))
-groq_model_gpt_120b = ChatGroq(model="openai/gpt-oss-120b", api_key=os.getenv("GROQ_API_KEY"))
-groq_model_llama_4_scout_17b = ChatGroq(model="meta-llama/llama-4-scout-17b-16e-instruct", api_key=os.getenv("GROQ_API_KEY"))
+if not os.getenv("GROQ_API_KEY"):
+    raise RuntimeError(
+        "GROQ_API_KEY is not set. Copy .env.example to .env and add a key from "
+        "https://console.groq.com/keys -- the Groq client is built at import "
+        "time, so this module cannot load without one."
+    )
 
-user_prompt = "Create a simple calculator web app using html, css, and javascript"
+
+class AgentState(TypedDict, total=False):
+    """State passed between graph nodes. total=False since each node
+    contributes only its own keys."""
+    user_prompt: str
+    plan: Plan
+    task_plan: TaskPlan
+    coder_state: Optional[CoderState]
+    status: str
+
+# Groq fallback chain, best-first. Production models sit at the head AND tail so
+# the chain still works if the preview model in the middle is retired -- which is
+# exactly what happened to meta-llama/llama-4-scout-17b-16e-instruct, shut down
+# on 2026-07-17. Check https://console.groq.com/docs/deprecations before editing.
+#
+# For projects whose files outgrow the 131K window, swap the middle entry for
+# "minimaxai/minimax-m2.7" (196K context, also preview).
+FALLBACK_MODEL_IDS = [
+    "openai/gpt-oss-120b",  # production, 131K ctx -- flagship
+    "qwen/qwen3.6-27b",     # preview,    131K ctx -- Groq's recommended scout replacement
+    "openai/gpt-oss-20b",   # production, 131K ctx -- fastest, guaranteed floor
+]
+
+FALLBACK_MODELS = [
+    ChatGroq(model=model_id, api_key=os.getenv("GROQ_API_KEY"))
+    for model_id in FALLBACK_MODEL_IDS
+]
 
 
-def planner_agent(state: dict) -> dict:
+def planner_agent(state: AgentState) -> dict:
     print("\n ------- ENTERING PLANNER AGENT-------\n")
     user_prompt = state["user_prompt"]
     resp = safe_invoke(
-        [groq_model_gpt_120b, groq_model_gpt_20b, groq_model_llama_4_scout_17b],
+        FALLBACK_MODELS,
         structured_output=Plan,
         prompt=planner_prompt(user_prompt)
     )
     print(resp)
     return {"plan": resp}
 
-def architect_agent(state: dict) -> dict:
+def architect_agent(state: AgentState) -> dict:
     print("\n ------- ENTERING ARCHITECT AGENT-------\n")
     plan: Plan = state["plan"]
     resp = safe_invoke(
-        [groq_model_gpt_120b, groq_model_gpt_20b, groq_model_llama_4_scout_17b],
+        FALLBACK_MODELS,
         structured_output=TaskPlan,
         method="function_calling",
         prompt=architect_prompt(plan)
@@ -48,7 +76,7 @@ def architect_agent(state: dict) -> dict:
 
     return {"task_plan": resp}
 
-def coding_agent(state: dict) -> dict :
+def coding_agent(state: AgentState) -> dict:
     print("\n ------- ENTERING CODING AGENT-------\n")
     coder_state: CoderState = state.get("coder_state")
     if coder_state is None:
@@ -72,7 +100,7 @@ def coding_agent(state: dict) -> dict :
     coder_tools = [read_file, write_file, list_files, get_current_directory]
 
     errors = []
-    for model in [groq_model_gpt_120b, groq_model_gpt_20b, groq_model_llama_4_scout_17b]:
+    for model in FALLBACK_MODELS:
         try:
             print(f"\nCoding with model: {model.model_name}")
             coder_agent = create_react_agent(model, coder_tools)
@@ -86,7 +114,7 @@ def coding_agent(state: dict) -> dict :
             )
             break
         except Exception as e:
-            print(f"⚠️ Coding agent failed with {model.model_name}: {str(e)}")
+            print(f"[WARN] Coding agent failed with {model.model_name}: {str(e)}")
             errors.append(f"{model.model_name}: {e}")
             continue
     else:
@@ -102,7 +130,7 @@ def coding_agent(state: dict) -> dict :
     
 
     
-graph = StateGraph(dict)
+graph = StateGraph(AgentState)
 graph.add_node("planner", planner_agent)
 graph.add_node("architect", architect_agent)
 graph.add_node("coder", coding_agent)

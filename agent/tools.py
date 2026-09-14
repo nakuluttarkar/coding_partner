@@ -1,17 +1,25 @@
 import pathlib
-import subprocess
-from typing import Tuple
 
 from langchain_core.tools import tool
 
-PROJECT_ROOT = pathlib.Path.cwd()
+# Anchored to this file rather than the process cwd. Streamlit (and some IDEs)
+# launch from a different directory, which previously scattered generated_project/
+# wherever the process happened to start instead of the repo root.
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 GENERATED_PROJECT_ROOT = PROJECT_ROOT / "generated_project"
 
 
 def safe_path_for_project(path: str) -> pathlib.Path:
-    p = (GENERATED_PROJECT_ROOT / path).resolve()
-    if GENERATED_PROJECT_ROOT.resolve() not in p.parents and GENERATED_PROJECT_ROOT.resolve() != p.parent and GENERATED_PROJECT_ROOT.resolve() != p:
-        raise ValueError("Attempt to write outside project root")
+    """Resolve `path` inside the generated-project sandbox.
+
+    Raises ValueError if it escapes, whether by `..` traversal or by being
+    absolute -- pathlib's `/` discards the left operand when the right side is
+    absolute, so both cases have to be caught after resolving.
+    """
+    root = GENERATED_PROJECT_ROOT.resolve()
+    p = (root / path).resolve()
+    if not p.is_relative_to(root):
+        raise ValueError(f"Attempt to access path outside project root: {path}")
     return p
 
 
@@ -49,18 +57,6 @@ def list_files(directory: str = ".") -> str:
         return f"ERROR: {p} is not a directory"
     files = [str(f.relative_to(GENERATED_PROJECT_ROOT)) for f in p.glob("**/*") if f.is_file()]
     return "\n".join(files) if files else "No files found."
-
-@tool("list_file")
-def list_file(directory: str = ".") -> str:
-    """Alias for list_files: Lists all files in the specified directory within the project root."""
-    return list_files(directory)
-
-@tool("run_cmd")
-def run_cmd(cmd: str, cwd: str = None, timeout: int = 30) -> Tuple[int, str, str]:
-    """Runs a shell command in the specified directory and returns the result."""
-    cwd_dir = safe_path_for_project(cwd) if cwd else GENERATED_PROJECT_ROOT
-    res = subprocess.run(cmd, shell=True, cwd=str(cwd_dir), capture_output=True, text=True, timeout=timeout)
-    return res.returncode, res.stdout, res.stderr
 
 
 def init_project_root():

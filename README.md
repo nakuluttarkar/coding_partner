@@ -33,9 +33,22 @@ The coder is a ReAct agent with four sandboxed tools (`read_file`, `write_file`,
 
 Every agent tries three Groq models in order, falling back to the next on failure:
 
-1. `openai/gpt-oss-120b`
-2. `openai/gpt-oss-20b`
-3. `meta-llama/llama-4-scout-17b-16e-instruct`
+| # | Model | Status | Context |
+|---|---|---|---|
+| 1 | `openai/gpt-oss-120b` | production | 131K |
+| 2 | `qwen/qwen3.6-27b` | preview | 131K |
+| 3 | `openai/gpt-oss-20b` | production | 131K |
+
+The chain is defined once as `FALLBACK_MODEL_IDS` in `agent/graph.py`. Production models sit
+at both the head and the tail deliberately: preview models can be retired at short notice, so
+the chain stays functional even if the middle entry disappears. Groq publishes retirements at
+[console.groq.com/docs/deprecations](https://console.groq.com/docs/deprecations) — worth a
+glance if runs start failing.
+
+If generated files outgrow the 131K window, swap the middle entry for `minimaxai/minimax-m2.7`
+(196K context, also preview). Avoid `groq/compound` and `groq/compound-mini` here: they
+orchestrate their own built-in tools server-side and don't support the local tool-calling this
+project relies on.
 
 The planner and architect go through `safe_invoke` in `agent/utils.py`, which additionally
 retries a rate-limited model in place with exponential backoff before moving on. The coder
@@ -131,8 +144,20 @@ agent/
   utils.py     # model fallback + retry
 streamlit/
   app.py       # web UI
+tests/         # pytest suite (no API key required)
 main.py        # CLI entry point
 ```
+
+### Tests
+
+```bash
+uv run pytest
+```
+
+The suite covers the model fallback/retry logic, the path sandbox, and the coder
+loop. It needs no Groq key: `tests/conftest.py` sets a dummy one so the client can
+be constructed, and no test makes a real API call. CI runs it on every push and
+pull request (`.github/workflows/ci.yml`).
 
 ## License
 
