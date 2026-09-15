@@ -21,7 +21,7 @@ except RuntimeError as exc:
 
 from agent.bundle import find_entry_html, inline_html
 from agent.tools import (
-    GENERATED_PROJECT_ROOT, init_project_root, list_files, read_file,
+    GENERATED_PROJECT_ROOT, init_project_root, list_files, project_fingerprint, read_file,
 )
 
 init_project_root()
@@ -35,6 +35,9 @@ if st.button("Generate Project"):
     if not user_prompt.strip():
         st.error("Please enter a project prompt")
     else:
+        # Forget any earlier project first, so a run that fails part-way never
+        # leaves this session offering a half-written directory.
+        st.session_state.pop("project_fingerprint", None)
         try:
             # stream() rather than invoke() so each agent reports as it finishes,
             # instead of the user staring at one spinner for several minutes.
@@ -97,6 +100,9 @@ if st.button("Generate Project"):
                                      if problems else "**Verified:** all referenced assets exist")
                 status.update(label="Project generated", state="complete")
 
+            # Record exactly which files this session produced.
+            st.session_state["project_fingerprint"] = project_fingerprint()
+
             if problems:
                 st.warning("Verification found issues:\n\n"
                            + "\n".join(f"- {p}" for p in problems))
@@ -108,13 +114,21 @@ if st.button("Generate Project"):
             st.code(traceback.format_exc())
 
 
+# generated_project/ is shared on disk and outlives every browser session, so
+# only show a project this session generated, and only while the files on disk
+# are still the ones it generated. Without this check a freshly opened app
+# offered the previous visitor's project -- preview, files and download.
+session_fingerprint = st.session_state.get("project_fingerprint")
+show_project = session_fingerprint is not None and session_fingerprint == project_fingerprint()
+
+
 # ---------------------
 # Preview
 # ---------------------
 # Rendered from the inlined single file, so the preview shows the project as a
 # self-contained page -- the same thing the standalone download produces.
 
-entry = find_entry_html(GENERATED_PROJECT_ROOT)
+entry = find_entry_html(GENERATED_PROJECT_ROOT) if show_project else None
 if entry is not None:
     st.subheader("Preview")
     try:
@@ -129,7 +143,7 @@ if entry is not None:
 
 generated_files = (
     sorted(f for f in GENERATED_PROJECT_ROOT.rglob("*") if f.is_file())
-    if GENERATED_PROJECT_ROOT.exists()
+    if show_project and GENERATED_PROJECT_ROOT.exists()
     else []
 )
 
@@ -150,7 +164,12 @@ st.subheader("Download your generated project")
 # does not work: clicking the download button triggers a rerun in which the
 # outer button is False, so the download button disappears before it fires.
 if not generated_files:
-    st.info("No generated project found. Please generate a project first.")
+    if session_fingerprint is not None:
+        st.info("The project you generated here has since been replaced by a newer run. "
+                "Generate again to get a fresh copy.")
+    else:
+        st.info("No project generated in this session yet. Enter a prompt above and "
+                "click Generate Project.")
 else:
     col_zip, col_single = st.columns(2)
 

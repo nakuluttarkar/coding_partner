@@ -65,6 +65,26 @@ def init_project_root():
     return str(GENERATED_PROJECT_ROOT)
 
 
+def project_fingerprint():
+    """Identify exactly which files are in the generated project right now.
+
+    (relative path, size, modification time) for every file, or None if there
+    are none. generated_project/ is shared on disk and outlives any one browser
+    session, so the UI records this when a session finishes generating, and
+    only offers the project while it still matches -- a fresh session, or one
+    whose project another run has since written over, gets nothing stale.
+    """
+    if not GENERATED_PROJECT_ROOT.is_dir():
+        return None
+    entries = []
+    for path in sorted(GENERATED_PROJECT_ROOT.rglob("*")):
+        if path.is_file():
+            stat = path.stat()
+            entries.append((path.relative_to(GENERATED_PROJECT_ROOT).as_posix(),
+                            stat.st_size, stat.st_mtime_ns))
+    return tuple(entries) or None
+
+
 def clear_project_root():
     """Empty the generated project before a new run.
 
