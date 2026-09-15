@@ -60,6 +60,14 @@ The coder is a ReAct agent with four sandboxed tools (`read_file`, `write_file`,
 `get_current_directory`) defined in `agent/tools.py`. All file paths are confined to
 `generated_project/`; attempts to escape it raise an error.
 
+Each coder step is handed its context rather than going to find it: the shared class contract,
+the list of every planned file in build order, a one-line-per-file index of what is already
+written (what each page loads, which ids and classes it uses, what each script defines and uses
+from other files), and the current content of its own file. It reads another file only when it
+needs something the index can't give. Telling it to read every file instead made each step's
+context grow with the project, until later steps exceeded Groq's per-minute token limit and
+failed.
+
 Every agent tries three Groq models in order, falling back to the next on failure:
 
 | # | Model | Context | Max output |

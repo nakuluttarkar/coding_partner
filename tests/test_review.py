@@ -172,9 +172,18 @@ def test_fix_plan_groups_by_file_orders_by_dependency_and_keeps_contract(tmp_pat
     assert plan.shared_contract == ".hidden -> display:none"
 
     page, script = (s.task_description for s in plan.implementation_steps)
-    assert "read it with read_file" in page
+    assert "shown under Existing Content" in page
+    assert "read it with read_file" not in page, "the coder already has the content"
     assert "add script tag" in page
     assert "does not exist yet" in script
     assert "uses storage before load" in script and "add close handler" in script
     assert "Original purpose of this file: App logic" in script
     assert "REVIEW FIX (round 1)" in script
+
+
+def test_index_lists_the_classes_a_page_uses(tmp_path):
+    """The coder writes a stylesheet from the index rather than by reading the
+    HTML, so the classes the markup uses have to be in it."""
+    write(tmp_path, "index.html", '<div class="kanban-board"><p class="task-title hidden"></p></div>')
+    digest = review.build_digest(tmp_path, 5000)
+    assert ".kanban-board" in digest and ".task-title" in digest and ".hidden" in digest

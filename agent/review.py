@@ -28,6 +28,7 @@ _LINE_COMMENT_RE = re.compile(r"^[ \t]*//.*$", re.MULTILINE)
 _LINK_HREF_RE = re.compile(r"""<link\b[^>]*\bhref\s*=\s*["']([^"']+\.css)["']""", re.IGNORECASE)
 _SCRIPT_SRC_RE = re.compile(r"""<script\b[^>]*\bsrc\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
 _ID_ATTR_RE = re.compile(r"""\bid\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+_CLASS_ATTR_RE = re.compile(r"""\bclass\s*=\s*["']([^"']*)["']""", re.IGNORECASE)
 _WINDOW_DEF_RE = re.compile(r"\bwindow\.([A-Za-z_$][\w$]*)\s*=(?!=)")
 _TOP_LEVEL_DEF_RE = re.compile(
     r"^(?:async\s+)?function\s+([A-Za-z_$][\w$]*)|^(?:const|let|var|class)\s+([A-Za-z_$][\w$]*)",
@@ -177,8 +178,9 @@ def build_digest(root, max_chars: int) -> str:
             css = [r for r in (_resolve(root, path, h) for h in _LINK_HREF_RE.findall(text)) if r]
             scripts = [r for r in (_resolve(root, path, s) for s in _SCRIPT_SRC_RE.findall(text)) if r]
             ids = ["#" + i for i in _ID_ATTR_RE.findall(text)]
+            classes = ["." + c for attr in _CLASS_ATTR_RE.findall(text) for c in attr.split()]
             lines.append(f"{rel}: css {_cap(css, 6)}; scripts in load order {_cap(scripts, 12)}; "
-                         f"ids {_cap(ids, 12)}")
+                         f"ids {_cap(ids, 12)}; classes {_cap(classes, 15)}")
         elif suffix == ".js":
             own = sorted(name for name, source in defined_by.items() if source == rel)
             uses = []
@@ -258,12 +260,13 @@ def build_fix_plan(issues, original_plan: TaskPlan, review_round: int, root) -> 
         lines = [f"REVIEW FIX (round {review_round}). A reviewer found problems in `{path}`."]
         if (root / path).is_file():
             lines.append(
-                "This file already exists. First read it with read_file, then write the "
-                "COMPLETE corrected file with write_file. Keep everything that already "
-                "works; change only what the fixes below require."
+                "This file already exists; its current content is shown under Existing "
+                "Content, so there is no need to read it. Apply the fixes below and write "
+                "the COMPLETE corrected file with write_file, once. Keep everything that "
+                "already works; change only what the fixes require."
             )
         else:
-            lines.append("This file does not exist yet. Create it with write_file.")
+            lines.append("This file does not exist yet. Create it with write_file, once.")
         lines.append("Fixes:")
         for n, issue in enumerate(by_file[path], 1):
             lines.append(f"{n}. Problem: {issue.problem}")

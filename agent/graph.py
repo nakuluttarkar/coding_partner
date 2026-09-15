@@ -49,8 +49,14 @@ CODER_MODEL_IDS = [
     "qwen/qwen3.8-27b",
 ]
 
-# Injecting a large existing file doubles input tokens against an 8K/min budget.
-MAX_EXISTING_CONTENT_CHARS = 2000
+# Each coder step gets its own file's current content (needed to apply review
+# fixes) and a project index, instead of reading every other file. Reading every
+# file grew each step's context with the project: by step 8 of a 12-file app a
+# single request reached 7,197 input tokens, over qwen3.8's 7,000/minute limit.
+# 8K characters is about 2.3K tokens -- any file within the ~120-line guideline,
+# in full.
+MAX_EXISTING_CONTENT_CHARS = 8000
+CODER_DIGEST_CHARS = 2500
 
 # Review loop: coder -> reviewer -> coder (fixes) -> reviewer -> coder -> done.
 # At most MAX_REVIEW_ROUNDS reviews and the same number of fix passes; the last
@@ -136,7 +142,8 @@ def coding_agent(state: AgentState) -> dict:
     current_task = steps[coder_state.current_step_idx]
     existing_content = read_file.run(current_task.filepath)
     if len(existing_content) > MAX_EXISTING_CONTENT_CHARS:
-        existing_content = existing_content[:MAX_EXISTING_CONTENT_CHARS] + "\n... (truncated)"
+        existing_content = (existing_content[:MAX_EXISTING_CONTENT_CHARS]
+                            + "\n... (truncated -- read_file this file for the rest)")
 
     # Injected here rather than repeated by the architect in every task: making
     # the model duplicate it across all descriptions blew the output token
@@ -147,13 +154,29 @@ def coding_agent(state: AgentState) -> dict:
         f"names:\n{contract}\n\n" if contract.strip() else ""
     )
 
+    # The project index replaces reading every file. The planned file list
+    # matters most early: an HTML page written first has to load scripts that
+    # do not exist on disk yet. During a fix pass the coder's own plan lists only
+    # the files being fixed, so the full list comes from the original plan.
+    full_plan = state.get("task_plan") or coder_state.task_plan
+    planned = [step.filepath for step in full_plan.implementation_steps]
+    written = (build_digest(GENERATED_PROJECT_ROOT, CODER_DIGEST_CHARS)
+               if GENERATED_PROJECT_ROOT.is_dir() else "")
+    index_lines = []
+    if planned:
+        index_lines.append("Files in this project, in build order: " + ", ".join(planned))
+    if written:
+        index_lines.append("Already written:\n" + written)
+    index_block = ("Project index:\n" + "\n".join(index_lines) + "\n\n") if index_lines else ""
+
     system_prompt = coder_prompt()
     user_prompt = (
         f"{contract_block}"
+        f"{index_block}"
         f"Task: {current_task.task_description}\n"
         f"File: {current_task.filepath}\n"
-        f"Existing Content: \n{existing_content}\n"
-        "Use write_file(path, content) to save changes"
+        f"Existing Content: \n{existing_content or '(file does not exist yet)'}\n"
+        "Save the file with write_file(path, content), once."
     )
 
     coder_tools = [read_file, write_file, list_files, get_current_directory]

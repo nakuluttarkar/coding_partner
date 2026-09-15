@@ -45,9 +45,13 @@ class _StubReadFile:
 
 
 @pytest.fixture
-def no_disk_reads(monkeypatch):
-    """coding_agent reads the target file for context; keep tests off the disk."""
+def no_disk_reads(monkeypatch, tmp_path):
+    """coding_agent reads its target file and indexes the project for context;
+    keep both off the real generated_project/ directory."""
     monkeypatch.setattr(g, "read_file", _StubReadFile())
+    empty = tmp_path / "empty_project"
+    empty.mkdir()
+    monkeypatch.setattr(g, "GENERATED_PROJECT_ROOT", empty)
 
 
 @pytest.fixture
@@ -208,7 +212,89 @@ def test_coder_prompt_omits_the_contract_block_when_empty(monkeypatch, no_disk_r
     monkeypatch.setattr(g, "create_react_agent", lambda model, tools: Capturing())
     g.coding_agent({"task_plan": _task_plan("index.html")})
     assert "Shared class/structure contract" not in captured["user"]
-    assert captured["user"].startswith("Task:")
+    assert captured["user"].startswith("Project index:")
+
+
+# --- project index instead of reading every file -----------------------------
+# Telling the coder to read every earlier file grew each step's context with the
+# project, until a step of a 12-file app hit 7,197 input tokens against qwen3.8's
+# 7,000/minute limit. The coder is now handed an index instead.
+
+def _capture_coder_prompt(monkeypatch):
+    captured = {}
+
+    class Capturing:
+        def invoke(self, payload, *a, **k):
+            captured["user"] = payload["messages"][1]["content"]
+            return {"messages": []}
+
+    monkeypatch.setattr(g, "create_react_agent", lambda model, tools: Capturing())
+    return captured
+
+
+def test_coder_is_given_the_planned_files_and_an_index_of_written_ones(project, monkeypatch):
+    (project / "index.html").write_text(
+        '<div class="kanban-board" id="board"></div><script src="scripts/app.js" defer></script>',
+        encoding="utf-8")
+    captured = _capture_coder_prompt(monkeypatch)
+    plan = _task_plan("index.html", "styles/base.css", "scripts/storage.js", "scripts/app.js")
+
+    g.coding_agent({"task_plan": plan, "coder_state": CoderState(task_plan=plan, current_step_idx=1)})
+
+    prompt = captured["user"]
+    assert ("Files in this project, in build order: index.html, styles/base.css, "
+            "scripts/storage.js, scripts/app.js") in prompt
+    assert "Already written:" in prompt
+    assert ".kanban-board" in prompt and "#board" in prompt
+    assert prompt.index("Project index:") < prompt.index("Task:")
+
+
+def test_a_fix_pass_still_sees_every_planned_file(project, monkeypatch):
+    """A fix plan lists only the files being fixed; the coder must still see the
+    whole project, or a page fix cannot know which scripts exist."""
+    captured = _capture_coder_prompt(monkeypatch)
+    original = _task_plan("index.html", "scripts/storage.js", "scripts/app.js")
+    fix_plan = _task_plan("index.html")
+
+    g.coding_agent({"task_plan": original,
+                    "coder_state": CoderState(task_plan=fix_plan, current_step_idx=0)})
+
+    assert "index.html, scripts/storage.js, scripts/app.js" in captured["user"]
+
+
+def test_existing_file_content_is_passed_in_full(project, monkeypatch):
+    body = "<p>keep this line</p>\n" * 100   # ~2.2K chars: over the old 2K cap
+    (project / "index.html").write_text(body, encoding="utf-8")
+    captured = _capture_coder_prompt(monkeypatch)
+
+    g.coding_agent({"task_plan": _task_plan("index.html")})
+
+    assert body.strip() in captured["user"]
+    assert "truncated" not in captured["user"]
+
+
+def test_an_oversized_existing_file_is_marked_truncated(project, monkeypatch):
+    (project / "index.html").write_text("x" * (g.MAX_EXISTING_CONTENT_CHARS + 500), encoding="utf-8")
+    captured = _capture_coder_prompt(monkeypatch)
+
+    g.coding_agent({"task_plan": _task_plan("index.html")})
+
+    assert "truncated -- read_file this file for the rest" in captured["user"]
+
+
+def test_a_missing_file_is_labelled_rather_than_left_blank(project, monkeypatch):
+    captured = _capture_coder_prompt(monkeypatch)
+    g.coding_agent({"task_plan": _task_plan("scripts/new.js")})
+    assert "(file does not exist yet)" in captured["user"]
+
+
+def test_coder_instructions_no_longer_ask_it_to_read_every_file():
+    from agent.prompts import coder_prompt
+    text = coder_prompt()
+    assert "read every HTML file" not in text
+    assert "Review all existing files" not in text
+    assert "Do NOT read other files just to check" in text
+    assert "write_file ONCE" in text
 
 
 def test_shared_contract_is_not_exposed_to_the_llm_as_a_hidden_field():
