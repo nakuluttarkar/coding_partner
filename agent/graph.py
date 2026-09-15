@@ -7,7 +7,11 @@ from .prompts import *
 from .states import *
 from agent.tools import (
     write_file, read_file, get_current_directory, list_files,
-    GENERATED_PROJECT_ROOT, clear_project_root,
+    GENERATED_PROJECT_ROOT, clear_project_root, safe_path_for_project,
+)
+from agent.review import (
+    batch_files, build_digest, build_fix_plan, clean_issues, collect_review_files,
+    format_files_block,
 )
 from agent.verify import find_problems
 from dotenv import load_dotenv
@@ -28,9 +32,6 @@ if not os.getenv("GROQ_API_KEY"):
 # the chain still works if the preview model in the middle is retired -- which is
 # exactly what happened to meta-llama/llama-4-scout-17b-16e-instruct, shut down
 # on 2026-07-17. Check https://console.groq.com/docs/deprecations before editing.
-#
-# For projects whose files outgrow the 131K window, swap the middle entry for
-# "minimaxai/minimax-m2.7" (196K context, also preview).
 FALLBACK_MODEL_IDS = [
     "openai/gpt-oss-120b",  # 131K ctx, 64K max out -- the only reliable architect
     "qwen/qwen3.8-27b",     # 131K ctx, 16K max out -- no output cap, unlike 3.6
@@ -51,13 +52,29 @@ CODER_MODEL_IDS = [
 # Injecting a large existing file doubles input tokens against an 8K/min budget.
 MAX_EXISTING_CONTENT_CHARS = 2000
 
+# Review loop: coder -> reviewer -> coder (fixes) -> reviewer -> coder -> done.
+# At most MAX_REVIEW_ROUNDS reviews and the same number of fix passes; the last
+# fix pass is not reviewed again, so a run always terminates.
+MAX_REVIEW_ROUNDS = 2
+MAX_ISSUES_PER_ROUND = 8
 
-def _build(model_ids):
-    return [ChatGroq(model=m, api_key=os.getenv("GROQ_API_KEY")) for m in model_ids]
+# Sized for the free tier's 8,000 tokens per minute. Groq counts a request's
+# input plus its output allowance against that limit and rejects a request that
+# exceeds it outright, so each review batch plus REVIEW_MAX_OUTPUT_TOKENS has to
+# stay under it. Roughly 6K characters of code is ~2K tokens; with the prompt,
+# project index and findings a batch lands near 4K tokens of input.
+REVIEW_BATCH_CHARS = 6000
+REVIEW_DIGEST_CHARS = 2000
+REVIEW_MAX_OUTPUT_TOKENS = 3000
+
+
+def _build(model_ids, **kwargs):
+    return [ChatGroq(model=m, api_key=os.getenv("GROQ_API_KEY"), **kwargs) for m in model_ids]
 
 
 FALLBACK_MODELS = _build(FALLBACK_MODEL_IDS)
 CODER_MODELS = _build(CODER_MODEL_IDS)
+REVIEWER_MODELS = _build(FALLBACK_MODEL_IDS, max_tokens=REVIEW_MAX_OUTPUT_TOKENS)
 
 
 class AgentState(TypedDict, total=False):
@@ -69,6 +86,9 @@ class AgentState(TypedDict, total=False):
     coder_state: Optional[CoderState]
     status: str
     problems: list
+    review_round: int
+    review_issues: list
+    review_history: list
 
 
 def planner_agent(state: AgentState) -> dict:
@@ -108,11 +128,11 @@ def coding_agent(state: AgentState) -> dict:
     coder_state: CoderState = state.get("coder_state")
     if coder_state is None:
         coder_state = CoderState(task_plan=state["task_plan"], current_step_idx=0)
-    
+
     steps= coder_state.task_plan.implementation_steps
     if coder_state.current_step_idx >= len(steps):
         return {"coder_state": coder_state, "status": "DONE"}
-    
+
     current_task = steps[coder_state.current_step_idx]
     existing_content = read_file.run(current_task.filepath)
     if len(existing_content) > MAX_EXISTING_CONTENT_CHARS:
@@ -165,6 +185,87 @@ def coding_agent(state: AgentState) -> dict:
     return {"coder_state": coder_state}
 
 
+def _is_safe_path(path: str) -> bool:
+    try:
+        safe_path_for_project(path)
+        return True
+    except ValueError:
+        return False
+
+
+def reviewer_agent(state: AgentState) -> dict:
+    """Review the written project and hand concrete fixes back to the coder.
+
+    The coder writes one file per step and never sees the project as a whole,
+    so cross-file defects -- a page not loading a script it depends on, a
+    script looking up an id the HTML lacks -- are invisible to it. The reviewer
+    reads every file (in batches, to fit the free tier's per-minute token
+    limit) plus a project index, and returns issues as coder tasks.
+    """
+    review_round = state.get("review_round", 0) + 1
+    console(f"\n ------- ENTERING REVIEWER (round {review_round}/{MAX_REVIEW_ROUNDS})-------\n")
+
+    root = GENERATED_PROJECT_ROOT
+    task_plan: TaskPlan = state["task_plan"]
+    findings = find_problems(root)
+    files = collect_review_files(root)
+    digest = build_digest(root, REVIEW_DIGEST_CHARS)
+    batches = batch_files(files, REVIEW_BATCH_CHARS)
+
+    raw_issues, errors = [], []
+    for n, batch in enumerate(batches, 1):
+        names = ", ".join(rel for rel, _ in batch)
+        console(f"[REVIEW] batch {n}/{len(batches)}: {names}")
+        prompt = reviewer_prompt(
+            state.get("user_prompt", ""),
+            task_plan.shared_contract,
+            digest,
+            findings,
+            format_files_block(batch),
+            MAX_ISSUES_PER_ROUND,
+        )
+        try:
+            result = safe_invoke(
+                REVIEWER_MODELS,
+                structured_output=ReviewResult,
+                method="function_calling",
+                prompt=prompt,
+            )
+        except RuntimeError as exc:
+            # Unlike a failed coder step, a failed review loses nothing: the
+            # project is already on disk. Record the gap and keep the issues the
+            # other batches found, rather than failing the whole run.
+            errors.append(f"batch {n} ({names}): {exc}")
+            console(f"[REVIEW] batch {n} failed, continuing without it")
+            continue
+        raw_issues.extend(result.issues if result else [])
+
+    issues = clean_issues(raw_issues, [rel for rel, _ in files], MAX_ISSUES_PER_ROUND, _is_safe_path)
+    for issue in issues:
+        console(f"[REVIEW] {issue.file}: {issue.problem}")
+    if not issues:
+        console("[REVIEW] No blocking issues." if not errors
+                else "[REVIEW] No issues from the batches that completed.")
+
+    history = list(state.get("review_history") or [])
+    history.append({
+        "round": review_round,
+        "batches": len(batches),
+        "issues": len(issues),
+        "files": sorted({issue.file for issue in issues}),
+        "errors": errors,
+    })
+    update = {"review_round": review_round, "review_issues": issues, "review_history": history}
+
+    if issues:
+        fix_plan = build_fix_plan(issues, task_plan, review_round, root)
+        update["coder_state"] = CoderState(task_plan=fix_plan, current_step_idx=0)
+        update["status"] = "FIXING"
+    else:
+        update["status"] = "REVIEWED"
+    return update
+
+
 def verifier_agent(state: AgentState) -> dict:
     """Deterministic post-generation checks -- no model call, no tokens spent."""
     console("\n ------- ENTERING VERIFIER-------\n")
@@ -176,17 +277,39 @@ def verifier_agent(state: AgentState) -> dict:
     return {"problems": problems}
 
 
+def route_after_coder(state: AgentState) -> str:
+    if state.get("status") != "DONE":
+        return "coder"
+    # Each finished pass is reviewed until the round limit is spent. After the
+    # final fix pass the review_round equals the limit, so it goes straight on.
+    if state.get("review_round", 0) < MAX_REVIEW_ROUNDS:
+        return "reviewer"
+    return "verifier"
+
+
+def route_after_reviewer(state: AgentState) -> str:
+    return "coder" if state.get("review_issues") else "verifier"
+
+
 graph = StateGraph(AgentState)
 graph.add_node("planner", planner_agent)
 graph.add_node("architect", architect_agent)
 graph.add_node("coder", coding_agent)
+graph.add_node("reviewer", reviewer_agent)
 graph.add_node("verifier", verifier_agent)
 graph.add_edge("planner", "architect")
 graph.add_edge("architect", "coder")
 
-graph.add_conditional_edges("coder",
-lambda s: "verifier" if s.get("status") == "DONE" else "coder", 
-{"verifier": "verifier", "coder": "coder"})
+graph.add_conditional_edges(
+    "coder",
+    route_after_coder,
+    {"coder": "coder", "reviewer": "reviewer", "verifier": "verifier"},
+)
+graph.add_conditional_edges(
+    "reviewer",
+    route_after_reviewer,
+    {"coder": "coder", "verifier": "verifier"},
+)
 
 graph.add_edge("verifier", END)
 

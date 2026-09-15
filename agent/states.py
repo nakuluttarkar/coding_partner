@@ -37,3 +37,31 @@ class TaskPlan(BaseModel):
 class CoderState(BaseModel):
     task_plan: TaskPlan = Field(description="The plan for the task to be implemented")
     current_step_idx: int = Field(0, description="The index of the current step in the implementation steps")
+
+
+class ReviewIssue(BaseModel):
+    file: str = Field(
+        description=(
+            "Relative path of the ONE file that must change to fix this, exactly as "
+            "shown in the file headers, e.g. 'index.html' or 'scripts/app.js'."
+        )
+    )
+    problem: str = Field(
+        description="What is broken and how it shows up for the user, in one or two sentences."
+    )
+    fix: str = Field(
+        description=(
+            "The concrete change to make in that file: the exact tag, id, function or "
+            "CSS rule to add or change."
+        )
+    )
+
+
+class ReviewResult(BaseModel):
+    issues: list[ReviewIssue] = Field(
+        default_factory=list,
+        description=(
+            "Defects that break the app or a requested feature, most severe first. "
+            "Empty when nothing needs fixing."
+        ),
+    )

@@ -139,17 +139,53 @@ def coder_prompt():
     """
     return CODER_PROMPT
 
-def code_review_prompt(file, content):
-    CODE_REVIEW_PROMPT = f"""
-    You are a senior code reviewer. Review this file for:
-    - correctness
-    - code quality
-    - security or performance issues
-    - unused code or logical flaws
+def reviewer_prompt(user_prompt, contract, digest, findings, files_block, max_issues):
+    findings_block = "\n".join(f"    - {f}" for f in findings) if findings else "    - none"
+    REVIEWER_PROMPT = f"""
+    You are the REVIEWER agent. Another agent wrote a web project one file at a
+    time, so no single step could see how the files fit together. Find the defects
+    that stop the finished project from working, and describe exact fixes.
 
-    Provide concise, actionable feedback.
-    File name: {file}
-    Code:
-    {content}
+    What the user asked for:
+    {user_prompt}
+
+    Shared class/structure contract the files were meant to follow:
+    {contract or "(none)"}
+
+    Project index -- every file, with what it loads, defines and uses:
+    {digest}
+
+    Findings from automatic checks. Treat each as a real defect to fix unless it is
+    clearly a false positive:
+{findings_block}
+
+    Look for, in this order of importance:
+    1. Cross-file wiring. A page that does not load a script it depends on. A
+       script using a global (window.X) defined in a file the page loads later or
+       not at all -- classic scripts run in load order, so a dependency must be
+       loaded BEFORE the script that uses it. A script looking up an id or class
+       the HTML never contains.
+    2. Anything that throws at runtime or leaves a feature dead: undefined
+       functions, wrong element ids, event handlers never attached, a modal that
+       never opens or never closes.
+    3. Features the user asked for that are missing or not wired up.
+    4. Classes applied with no CSS rule, especially state classes like .hidden.
+
+    Do NOT report style preferences, naming opinions, missing comments, or
+    refactors. Only report something if leaving it would break the app or a
+    requested feature.
+
+    Rules for each issue:
+    - `file` is the ONE file that must change, written exactly as it appears in a
+      ===== FILE: header below. Only report issues for files shown in full below;
+      the other files are reviewed in separate requests.
+    - If a fix needs changes in two files, report two issues.
+    - `fix` must be concrete: name the exact tag, id, function or rule to add or
+      change.
+    - Report at most {max_issues} issues, most severe first. Return an empty list
+      if the files below have no such defects.
+
+    Files to review in full (comments stripped to save space):
+    {files_block}
     """
-    return CODE_REVIEW_PROMPT
+    return REVIEWER_PROMPT

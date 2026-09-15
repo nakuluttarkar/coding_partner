@@ -40,6 +40,7 @@ if st.button("Generate Project"):
             # instead of the user staring at one spinner for several minutes.
             with st.status("Generating project...", expanded=True) as status:
                 reported_steps = 0
+                fixing = False
                 problems = []
                 for chunk in agent.stream(
                     {"user_prompt": user_prompt},
@@ -59,10 +60,27 @@ if st.button("Generate Project"):
                             coder_state = update.get("coder_state")
                             if coder_state:
                                 steps = coder_state.task_plan.implementation_steps
+                                verb = "Fixed" if fixing else "Wrote"
                                 # Report every step finished since the last update.
                                 while reported_steps < coder_state.current_step_idx:
-                                    st.write(f"Wrote `{steps[reported_steps].filepath}`  ({reported_steps + 1}/{len(steps)})")
+                                    st.write(f"{verb} `{steps[reported_steps].filepath}`  ({reported_steps + 1}/{len(steps)})")
                                     reported_steps += 1
+                        elif node == "reviewer":
+                            issues = update.get("review_issues") or []
+                            round_no = update.get("review_round")
+                            history = update.get("review_history") or []
+                            failed = history[-1]["errors"] if history else []
+                            if issues:
+                                st.write(f"**Review round {round_no}:** {len(issues)} issue(s) sent back to the coder")
+                                for issue in issues:
+                                    st.write(f"- `{issue.file}`: {issue.problem}")
+                                # A fix pass is a fresh plan whose steps count from zero.
+                                reported_steps = 0
+                                fixing = True
+                            else:
+                                st.write(f"**Review round {round_no}:** no blocking issues")
+                            if failed:
+                                st.write(f"Review incomplete: {len(failed)} batch(es) could not be reviewed")
                         elif node == "verifier":
                             problems = update.get("problems") or []
                             st.write(f"**Verified:** {len(problems)} problem(s) found"
