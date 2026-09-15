@@ -94,10 +94,17 @@ project relies on. `allam-2-7b` has only a 4K context.
 Check what your account can actually reach with `client.models.list()` rather than the docs --
 model availability differs per account.
 
-The planner and architect go through `safe_invoke` in `agent/utils.py`, which additionally
-retries a rate-limited model in place with exponential backoff before moving on. The coder
-runs its own loop and only falls back across models. If all three fail on a step, the run
-aborts rather than skipping the file.
+Every model call goes through `invoke_with_fallback` in `agent/utils.py`. A per-minute rate
+limit that will clear within a minute is retried on the same model, honouring the wait Groq
+names (`975ms`, `7.5s`, `4m47s`). Limits that cannot clear in time — a daily token limit, a
+single request larger than the per-minute limit, or a wait longer than a minute — move straight
+to the next model instead of burning retries.
+
+A coder step only counts once its file has actually been written with new, non-empty content;
+a model that ends its turn without saving hands the step to the next model. If every model
+fails a step in the first pass, the run aborts rather than skipping the file. If every model
+fails a review fix, the file is restored as the step found it, the miss is recorded in
+`failed_fixes`, and the run carries on with the project it already has.
 
 ## Requirements
 

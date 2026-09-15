@@ -38,6 +38,32 @@ _ID_LOOKUP_RE = re.compile(r"""getElementById\(\s*["']([^"']+)["']""")
 _SELECTOR_LOOKUP_RE = re.compile(r"""querySelector(?:All)?\(\s*["']([^"']+)["']""")
 _CSS_CLASS_RE = re.compile(r"\.(-?[A-Za-z_][\w-]*)")
 
+# Function signatures. The index used to list only the names a script exposes,
+# so a call with the wrong arguments was invisible whenever caller and callee
+# were reviewed in different batches: dragDrop.js called
+# StorageAPI.updateTask(taskId, {status}) against updateTask(updatedTask), and
+# every card drop silently saved nothing.
+_FUNCTION_DEF_RE = re.compile(r"(?<![\w$.])function\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)")
+_VAR_FUNCTION_RE = re.compile(
+    r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?"
+    r"(?:function\b[^(]*\(([^)]*)\)|\(([^)]*)\)\s*=>|([A-Za-z_$][\w$]*)\s*=>)"
+)
+_WINDOW_ASSIGN_RE = re.compile(r"\bwindow\.([A-Za-z_$][\w$]*)\s*=(?!=)\s*")
+_METHOD_SHORTHAND_RE = re.compile(r"^(?:async\s+)?([A-Za-z_$][\w$]*)\s*\(([^)]*)\)\s*\{")
+_PROP_FUNCTION_RE = re.compile(r"^([A-Za-z_$][\w$]*)\s*:\s*(?:async\s+)?function\b[^(]*\(([^)]*)\)")
+_PROP_ARROW_RE = re.compile(
+    r"^([A-Za-z_$][\w$]*)\s*:\s*(?:async\s*)?(?:\(([^)]*)\)|([A-Za-z_$][\w$]*))\s*=>")
+_PROP_REF_RE = re.compile(r"^([A-Za-z_$][\w$]*)\s*(?::\s*([A-Za-z_$][\w$]*))?$")
+
+# State classes are listed first so a cap can never hide them. With a plain
+# 15-class cap, base.css's .hidden rule fell into "+7 more", and a reviewer
+# looking at themes.css concluded .hidden was undefined -- a false positive
+# that became a fix pass adding duplicate rules.
+_STATE_CLASSES = (".hidden", ".active", ".open")
+_CSS_CLASS_CAP = 40
+_HTML_CLASS_CAP = 30
+_API_CAP = 12
+
 _EXTERNAL_PREFIXES = ("http://", "https://", "//", "data:")
 
 
@@ -134,12 +160,133 @@ def _cap(items, limit):
     return items
 
 
+def _state_first(classes):
+    unique = list(dict.fromkeys(classes))
+    return ([c for c in _STATE_CLASSES if c in unique]
+            + [c for c in unique if c not in _STATE_CLASSES])
+
+
+def _params(raw):
+    text = " ".join((raw or "").split())
+    return text if len(text) <= 40 else text[:37] + "..."
+
+
+def _function_params(text):
+    """name -> parameter list for every named function in a script."""
+    params = {}
+    for name, raw in _FUNCTION_DEF_RE.findall(text):
+        params.setdefault(name, _params(raw))
+    for name, fn_params, arrow_params, single in _VAR_FUNCTION_RE.findall(text):
+        params.setdefault(name, _params(fn_params or arrow_params or single))
+    return params
+
+
+def _object_body(text, open_index):
+    """Text between the brace at open_index and its matching closing brace."""
+    depth = 0
+    for i in range(open_index, min(len(text), open_index + 6000)):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_index + 1:i]
+    return None
+
+
+def _top_level_entries(body):
+    """Split an object literal's body on commas that are not nested."""
+    entries, depth, start = [], 0, 0
+    for i, ch in enumerate(body):
+        if ch in "({[":
+            depth += 1
+        elif ch in ")}]":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            entries.append(body[start:i])
+            start = i + 1
+    entries.append(body[start:])
+    return [entry.strip() for entry in entries if entry.strip()]
+
+
+def _member_signatures(global_name, body, fn_params):
+    signatures = []
+    for entry in _top_level_entries(body):
+        if entry.startswith("..."):
+            continue
+        if not any(quote in entry for quote in "'\"`"):
+            entry = re.sub(r"//[^\n]*", "", entry).strip()
+        match = _METHOD_SHORTHAND_RE.match(entry)
+        if match:
+            signatures.append(f"{global_name}.{match.group(1)}({_params(match.group(2))})")
+            continue
+        match = _PROP_FUNCTION_RE.match(entry)
+        if match:
+            signatures.append(f"{global_name}.{match.group(1)}({_params(match.group(2))})")
+            continue
+        match = _PROP_ARROW_RE.match(entry)
+        if match:
+            signatures.append(
+                f"{global_name}.{match.group(1)}({_params(match.group(2) or match.group(3))})")
+            continue
+        match = _PROP_REF_RE.match(entry)
+        if match:
+            key, ref = match.group(1), match.group(2) or match.group(1)
+            if ref in fn_params:
+                signatures.append(f"{global_name}.{key}({fn_params[ref]})")
+    return signatures
+
+
+def script_api(text, top_level_names=()):
+    """Signatures of the functions a classic script makes global.
+
+    Covers the export shapes generated scripts use: an object literal assigned
+    to window (shorthand members, methods, function or arrow properties), a
+    window property pointing at a named object or function, and plain top-level
+    functions, which are globals in a classic script.
+    """
+    cleaned = _LINE_COMMENT_RE.sub("", _BLOCK_COMMENT_RE.sub("", text))
+    fn_params = _function_params(cleaned)
+    signatures = []
+    for match in _WINDOW_ASSIGN_RE.finditer(cleaned):
+        name, pos = match.group(1), match.end()
+        if cleaned.startswith("{", pos):
+            body = _object_body(cleaned, pos)
+            if body is not None:
+                signatures.extend(_member_signatures(name, body, fn_params))
+            continue
+        rest = cleaned[pos:pos + 300]
+        function = re.match(r"(?:async\s+)?function\b[^(]*\(([^)]*)\)", rest)
+        if function:
+            signatures.append(f"{name}({_params(function.group(1))})")
+            continue
+        ident = re.match(r"([A-Za-z_$][\w$]*)", rest)
+        if not ident:
+            continue
+        ref = ident.group(1)
+        if ref in fn_params:
+            signatures.append(f"{name}({fn_params[ref]})")
+            continue
+        declared = re.search(r"\b(?:const|let|var)\s+" + re.escape(ref) + r"\s*=\s*\{", cleaned)
+        if declared:
+            body = _object_body(cleaned, declared.end() - 1)
+            if body is not None:
+                signatures.extend(_member_signatures(name, body, fn_params))
+    for name in top_level_names:
+        if name in fn_params:
+            signatures.append(f"{name}({fn_params[name]})")
+    return list(dict.fromkeys(signatures))
+
+
 def build_digest(root, max_chars: int) -> str:
     """One line per file describing how it connects to the rest of the project.
 
     The point is to make wiring defects legible without sending every file:
     "stats.html loads [scripts/stats.js]" next to "scripts/stats.js uses
-    [storage <- scripts/storage.js]" shows the missing script tag directly.
+    [storage <- scripts/storage.js]" shows the missing script tag directly, and
+    "api [StorageAPI.updateTask(updatedTask)]" lets a call with the wrong
+    arguments be spotted from the file that makes it.
     """
     root = Path(root)
     if not root.is_dir():
@@ -156,11 +303,13 @@ def build_digest(root, max_chars: int) -> str:
 
     # Globals each script defines, so other scripts' uses can name their source.
     defined_by = {}
+    top_level = {}
     for path, text in texts.items():
         if text is None or path.suffix.lower() != ".js":
             continue
         rel = path.relative_to(root).as_posix()
         names = _WINDOW_DEF_RE.findall(text)
+        top_level[rel] = [fn_name for fn_name, _ in _TOP_LEVEL_DEF_RE.findall(text) if fn_name]
         for fn_name, var_name in _TOP_LEVEL_DEF_RE.findall(text):
             names.append(fn_name or var_name)
         for name in names:
@@ -180,9 +329,10 @@ def build_digest(root, max_chars: int) -> str:
             ids = ["#" + i for i in _ID_ATTR_RE.findall(text)]
             classes = ["." + c for attr in _CLASS_ATTR_RE.findall(text) for c in attr.split()]
             lines.append(f"{rel}: css {_cap(css, 6)}; scripts in load order {_cap(scripts, 12)}; "
-                         f"ids {_cap(ids, 12)}; classes {_cap(classes, 15)}")
+                         f"ids {_cap(ids, 12)}; classes {_cap(_state_first(classes), _HTML_CLASS_CAP)}")
         elif suffix == ".js":
             own = sorted(name for name, source in defined_by.items() if source == rel)
+            api = script_api(text, top_level.get(rel, ()))
             uses = []
             for name, source in defined_by.items():
                 if source == rel:
@@ -191,11 +341,11 @@ def build_digest(root, max_chars: int) -> str:
                     uses.append(f"{name} <- {source}")
             lookups = (["#" + i for i in _ID_LOOKUP_RE.findall(text)]
                        + _SELECTOR_LOOKUP_RE.findall(text))
-            lines.append(f"{rel}: defines {_cap(own, 10)}; uses from other files {_cap(uses, 10)}; "
-                         f"looks up {_cap(lookups, 12)}")
+            lines.append(f"{rel}: defines {_cap(own, 10)}; api {_cap(api, _API_CAP)}; "
+                         f"uses from other files {_cap(uses, 10)}; looks up {_cap(lookups, 12)}")
         elif suffix == ".css":
             classes = ["." + c for c in _CSS_CLASS_RE.findall(text)]
-            lines.append(f"{rel}: styles classes {_cap(classes, 15)}")
+            lines.append(f"{rel}: styles classes {_cap(_state_first(classes), _CSS_CLASS_CAP)}")
         else:
             lines.append(f"{rel}: {len(text.splitlines())} lines (not reviewed in full)")
 

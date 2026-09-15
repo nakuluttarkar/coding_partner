@@ -56,7 +56,9 @@ CODER_MODEL_IDS = [
 # 8K characters is about 2.3K tokens -- any file within the ~120-line guideline,
 # in full.
 MAX_EXISTING_CONTENT_CHARS = 8000
-CODER_DIGEST_CHARS = 2500
+# The index carries function signatures and longer class lists, so it gets more
+# room than the names-only version did.
+CODER_DIGEST_CHARS = 3500
 
 # Review loop: coder -> reviewer -> coder (fixes) -> reviewer -> coder -> done.
 # At most MAX_REVIEW_ROUNDS reviews and the same number of fix passes; the last
@@ -70,7 +72,7 @@ MAX_ISSUES_PER_ROUND = 8
 # stay under it. Roughly 6K characters of code is ~2K tokens; with the prompt,
 # project index and findings a batch lands near 4K tokens of input.
 REVIEW_BATCH_CHARS = 6000
-REVIEW_DIGEST_CHARS = 2000
+REVIEW_DIGEST_CHARS = 3500
 REVIEW_MAX_OUTPUT_TOKENS = 3000
 
 
@@ -95,6 +97,41 @@ class AgentState(TypedDict, total=False):
     review_round: int
     review_issues: list
     review_history: list
+    failed_fixes: list
+
+
+class StepNotWritten(RuntimeError):
+    """The coder finished a step without saving new content to its file."""
+
+
+def _read_if_file(path):
+    try:
+        return path.read_text(encoding="utf-8") if path.is_file() else None
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _check_written(model_name, rel_path, target, before):
+    """Raise unless the step left its file with new, non-empty content."""
+    after = _read_if_file(target)
+    if after is None:
+        raise StepNotWritten(f"{model_name} ended the step without writing {rel_path}")
+    if not after.strip():
+        raise StepNotWritten(f"{model_name} wrote {rel_path} but left it empty")
+    if before is not None and after == before:
+        raise StepNotWritten(f"{model_name} ended the step with {rel_path} unchanged")
+
+
+def _restore(target, before):
+    """Put a file back the way a step found it."""
+    try:
+        if before is None:
+            if target.is_file():
+                target.unlink()
+        else:
+            target.write_text(before, encoding="utf-8")
+    except OSError:
+        pass
 
 
 def planner_agent(state: AgentState) -> dict:
@@ -181,8 +218,20 @@ def coding_agent(state: AgentState) -> dict:
 
     coder_tools = [read_file, write_file, list_files, get_current_directory]
 
+    try:
+        target = safe_path_for_project(current_task.filepath)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Step {coder_state.current_step_idx + 1}/{len(steps)} has an invalid path "
+            f"({current_task.filepath}): {exc}"
+        ) from exc
+    before = _read_if_file(target)
+
     def run_coder(model):
-        return create_react_agent(model, coder_tools).invoke(
+        # Compared per attempt, not per step: a model that crashed after a
+        # partial write must not let the next model "succeed" by doing nothing.
+        attempt_before = _read_if_file(target)
+        result = create_react_agent(model, coder_tools).invoke(
             {
                 "messages": [
                     {"role": "system", "content": system_prompt},
@@ -190,13 +239,35 @@ def coding_agent(state: AgentState) -> dict:
                 ]
             }
         )
+        # A model can end its turn without ever calling write_file. A live fix
+        # pass did exactly that and was reported "fixed" with the file
+        # untouched, so an attempt only counts if the model leaves new,
+        # non-empty content. Raising here hands the step to the next model.
+        _check_written(model.model_name, current_task.filepath, target, attempt_before)
+        return result
 
     try:
-        # Retries rate-limited models in place: Groq's per-minute caps clear on
-        # their own, so giving up on the first 413 wastes a run that would have
-        # succeeded a minute later.
+        # Rate limits that clear within the minute are retried on the same
+        # model; any other failure -- including not writing the file -- moves
+        # on to the next model.
         invoke_with_fallback(CODER_MODELS, run_coder, label="Coding with")
     except RuntimeError as exc:
+        if state.get("status") == "FIXING":
+            # A review fix that no model could apply. The project was complete
+            # before review, so put the file back as this step found it -- a
+            # failed attempt may have half-applied a change -- record the miss,
+            # and carry on instead of failing a finished project.
+            _restore(target, before)
+            console(f"[FIX] Could not apply the review fix to {current_task.filepath}; "
+                    f"kept the version from before this step")
+            failed = list(state.get("failed_fixes") or [])
+            failed.append({
+                "file": current_task.filepath,
+                "round": state.get("review_round"),
+                "error": str(exc)[:500],
+            })
+            coder_state.current_step_idx += 1
+            return {"coder_state": coder_state, "failed_fixes": failed}
         # Advancing here would silently skip the file and report success on a
         # project that was never fully written.
         raise RuntimeError(

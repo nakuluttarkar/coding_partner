@@ -187,3 +187,94 @@ def test_index_lists_the_classes_a_page_uses(tmp_path):
     write(tmp_path, "index.html", '<div class="kanban-board"><p class="task-title hidden"></p></div>')
     digest = review.build_digest(tmp_path, 5000)
     assert ".kanban-board" in digest and ".task-title" in digest and ".hidden" in digest
+
+
+# --- function signatures -----------------------------------------------------
+# The live drag-and-drop bug: dragDrop.js called updateTask(taskId, {status})
+# against updateTask(updatedTask). Caller and callee were reviewed in different
+# batches and the index listed names only, so nothing showed the mismatch.
+
+LIVE_STORAGE_JS = """
+(function () {
+  const KEY = 'kanban-tasks';
+  function getTasks() { return JSON.parse(localStorage.getItem(KEY) || '[]'); }
+  function saveTasks(tasks) { localStorage.setItem(KEY, JSON.stringify(tasks)); }
+  function updateTask(updatedTask) { /* ... */ }
+  function deleteTask(id) { /* ... */ }
+  window.StorageAPI = {
+    getTasks,
+    saveTasks,
+    updateTask, // replaces a task by id
+    deleteTask,
+  };
+})();
+"""
+
+
+def test_api_lists_parameters_of_an_exported_object_literal():
+    api = review.script_api(LIVE_STORAGE_JS)
+    assert "StorageAPI.updateTask(updatedTask)" in api
+    assert "StorageAPI.saveTasks(tasks)" in api
+    assert "StorageAPI.getTasks()" in api
+    assert "StorageAPI.deleteTask(id)" in api
+
+
+def test_index_shows_the_signature_a_caller_in_another_file_must_match(tmp_path):
+    write(tmp_path, "storage.js", LIVE_STORAGE_JS)
+    write(tmp_path, "dragDrop.js", "StorageAPI.updateTask(taskId, { status: status });")
+    digest = review.build_digest(tmp_path, 5000)
+    assert "StorageAPI.updateTask(updatedTask)" in digest
+    assert "StorageAPI <- storage.js" in digest
+
+
+def test_api_covers_the_export_shapes_generated_scripts_use():
+    cases = [
+        ("window.UI = { render(tasks) { }, clear: function () { } };", (),
+         ["UI.render(tasks)", "UI.clear()"]),
+        ("window.Modal = { open: (task, onSave) => task };", (), ["Modal.open(task, onSave)"]),
+        ("window.Modal = { close: done => done };", (), ["Modal.close(done)"]),
+        ("function applyTheme(theme) {}\nwindow.applyTheme = applyTheme;", ("applyTheme",),
+         ["applyTheme(theme)"]),
+        ("window.init = function (root, options) {};", (), ["init(root, options)"]),
+        ("const storage = { get(key) {}, set(key, value) {} };\nwindow.storage = storage;", (),
+         ["storage.get(key)", "storage.set(key, value)"]),
+        ("function helper(a, b) {}", ("helper",), ["helper(a, b)"]),
+    ]
+    for source, top_level, expected in cases:
+        api = review.script_api(source, top_level)
+        for signature in expected:
+            assert signature in api, f"{signature} missing for: {source}"
+
+
+def test_api_ignores_non_function_members():
+    api = review.script_api("window.CONFIG = { key: 'kanban', retries: 3, open(x) {} };")
+    assert api == ["CONFIG.open(x)"]
+
+
+# --- class lists -------------------------------------------------------------
+
+def _index_line(root, prefix):
+    return next(line for line in review.build_digest(root, 100000).splitlines()
+                if line.startswith(prefix))
+
+
+def test_state_classes_are_never_hidden_by_the_stylesheet_cap(tmp_path):
+    """A stylesheet with more classes than the cap, defining .hidden last, must
+    still show .hidden -- the live false positive came from exactly this."""
+    rules = "".join(f".c{i} {{ color: red; }}\n" for i in range(60)) + ".hidden { display: none; }\n"
+    write(tmp_path, "base.css", rules)
+    line = _index_line(tmp_path, "base.css")
+    assert "'.hidden'" in line
+    assert line.index("'.hidden'") < line.index("'.c0'")
+
+
+def test_a_stylesheet_lists_up_to_forty_classes(tmp_path):
+    write(tmp_path, "base.css", "".join(f".c{i} {{}}\n" for i in range(40)))
+    line = _index_line(tmp_path, "base.css")
+    assert "'.c39'" in line and "more" not in line
+
+
+def test_a_page_lists_up_to_thirty_classes(tmp_path):
+    write(tmp_path, "index.html", "".join(f'<p class="k{i}"></p>' for i in range(30)))
+    line = _index_line(tmp_path, "index.html")
+    assert "'.k29'" in line and "more" not in line

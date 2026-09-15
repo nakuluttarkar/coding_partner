@@ -116,12 +116,85 @@ def test_backoff_is_capped():
     assert utils.backoff_seconds(Exception("429"), attempt=10) == 60
 
 
-def test_tpm_failure_is_retried_in_place(sleeps):
-    m1 = FakeModel("m1", [Exception(TPM_413)])
+def test_a_request_too_large_for_the_limit_goes_straight_to_the_next_model(sleeps):
+    """'Request too large' means this request alone exceeds the per-minute limit,
+    so an identical retry fails identically -- seen three times in a row live."""
+    m1 = FakeModel("m1", [Exception(TPM_413)] * 3)
     m2 = FakeModel("m2")
-    assert utils.safe_invoke([m1, m2], prompt="x") == "m1-ok"
-    assert m1.calls == 2, "a 413 TPM error clears on its own and must be retried"
-    assert m2.calls == 0
+    assert utils.safe_invoke([m1, m2], prompt="x") == "m2-ok"
+    assert m1.calls == 1
+    assert sleeps == []
+
+
+# --- limits that cannot clear in time ----------------------------------------
+# Shapes taken from live errors. A daily limit was retried in place three times
+# per request, costing about two minutes per step for nothing.
+
+TPD_429 = ("Error code: 429 - {'error': {'message': 'Rate limit reached for model "
+           "`openai/gpt-oss-120b` in organization `org_x` service tier `on_demand` on tokens "
+           "per day (TPD): Limit 200000, Used 195892, Requested 4774. Please try again in "
+           "4m47.712s.', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}")
+TPM_SHORT_429 = ("Error code: 429 - Rate limit reached for model `openai/gpt-oss-20b` on tokens "
+                 "per minute (TPM): Limit 8000, Used 6000, Requested 3000. Please try again in 7.5s.")
+TPM_LONG_429 = ("Error code: 429 - Rate limit reached for model `openai/gpt-oss-20b` on tokens "
+                "per minute (TPM): Limit 8000, Used 7900, Requested 3000. Please try again in 2m5s.")
+
+
+@pytest.mark.parametrize("text, seconds", [
+    ("Please try again in 975ms.", 0.975),
+    ("Please try again in 7.482s.", 7.482),
+    ("Please try again in 4m47.712s.", 287.712),
+    ("Please try again in 32m24s", 1944.0),
+    ("Please try again in 1h2m3s", 3723.0),
+])
+def test_retry_after_is_parsed_in_every_unit(text, seconds):
+    assert utils.parse_retry_after(Exception(text)) == pytest.approx(seconds)
+
+
+def test_retry_after_is_none_when_groq_gives_no_wait():
+    assert utils.parse_retry_after(Exception("429 Too Many Requests")) is None
+
+
+@pytest.mark.parametrize("message, retryable", [
+    (TPM_SHORT_429, True),            # clears within the minute
+    ("429 Too Many Requests", True),  # no wait given: back off and retry
+    (TPD_429, False),                 # daily limit
+    (TPM_413, False),                 # this request alone is over the limit
+    (OTPM_429, False),                # same, on the output-token cap
+    (TPM_LONG_429, False),            # clears, but later than the backoff cap
+    (TRUNCATED_400, False),           # not a rate limit at all
+])
+def test_which_limits_are_retried_in_place(message, retryable):
+    assert utils.is_retryable_in_place(Exception(message)) is retryable
+
+
+def test_a_daily_limit_goes_straight_to_the_next_model(sleeps):
+    m1 = FakeModel("m1", [Exception(TPD_429)] * 3)
+    m2 = FakeModel("m2")
+    assert utils.safe_invoke([m1, m2], prompt="x") == "m2-ok"
+    assert m1.calls == 1, "a daily limit cannot clear inside a retry window"
+    assert sleeps == []
+
+
+def test_a_wait_longer_than_the_cap_goes_straight_to_the_next_model(sleeps):
+    m1 = FakeModel("m1", [Exception(TPM_LONG_429)] * 3)
+    m2 = FakeModel("m2")
+    assert utils.safe_invoke([m1, m2], prompt="x") == "m2-ok"
+    assert m1.calls == 1
+    assert sleeps == []
+
+
+def test_a_short_per_minute_limit_is_still_retried_in_place(sleeps):
+    m1 = FakeModel("m1", [Exception(TPM_SHORT_429)])
+    assert utils.safe_invoke([m1], prompt="x") == "m1-ok"
+    assert m1.calls == 2
+    assert sleeps == [pytest.approx(8.5)]
+
+
+def test_error_explains_a_daily_limit(sleeps):
+    m1 = FakeModel("m1", [Exception(TPD_429)])
+    with pytest.raises(RuntimeError, match="daily token allowance"):
+        utils.safe_invoke([m1], prompt="x", retries=0)
 
 
 def test_error_explains_truncation_when_a_tool_call_was_cut_off(sleeps):

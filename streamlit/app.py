@@ -41,6 +41,8 @@ if st.button("Generate Project"):
             with st.status("Generating project...", expanded=True) as status:
                 reported_steps = 0
                 fixing = False
+                fix_round = None
+                failed_fixes = set()
                 problems = []
                 for chunk in agent.stream(
                     {"user_prompt": user_prompt},
@@ -58,12 +60,19 @@ if st.button("Generate Project"):
                             st.write(f"**Architected:** {count} implementation steps")
                         elif node == "coder":
                             coder_state = update.get("coder_state")
+                            for failure in update.get("failed_fixes") or []:
+                                failed_fixes.add((failure.get("round"), failure.get("file")))
                             if coder_state:
                                 steps = coder_state.task_plan.implementation_steps
                                 verb = "Fixed" if fixing else "Wrote"
                                 # Report every step finished since the last update.
                                 while reported_steps < coder_state.current_step_idx:
-                                    st.write(f"{verb} `{steps[reported_steps].filepath}`  ({reported_steps + 1}/{len(steps)})")
+                                    path = steps[reported_steps].filepath
+                                    counter = f"({reported_steps + 1}/{len(steps)})"
+                                    if fixing and (fix_round, path) in failed_fixes:
+                                        st.write(f"Could not fix `{path}`; kept the previous version  {counter}")
+                                    else:
+                                        st.write(f"{verb} `{path}`  {counter}")
                                     reported_steps += 1
                         elif node == "reviewer":
                             issues = update.get("review_issues") or []
@@ -77,6 +86,7 @@ if st.button("Generate Project"):
                                 # A fix pass is a fresh plan whose steps count from zero.
                                 reported_steps = 0
                                 fixing = True
+                                fix_round = round_no
                             else:
                                 st.write(f"**Review round {round_no}:** no blocking issues")
                             if failed:
