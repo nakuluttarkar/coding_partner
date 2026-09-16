@@ -73,3 +73,37 @@ def test_escape_is_blocked_through_the_tool_not_just_the_helper(sandbox, tmp_pat
     with pytest.raises(Exception):
         tools.write_file.invoke({"path": "../victim.txt", "content": "overwritten"})
     assert victim.read_text(encoding="utf-8") == "original"
+
+
+# --- project fingerprint -----------------------------------------------------
+# The UI only offers a project while the directory still matches what the
+# session generated, so the fingerprint must change on any add, rewrite or delete.
+
+def test_fingerprint_is_none_for_an_empty_project(sandbox):
+    assert tools.project_fingerprint() is None
+
+
+def test_fingerprint_is_none_when_the_directory_is_missing(sandbox):
+    sandbox.rmdir()
+    assert tools.project_fingerprint() is None
+
+
+def test_fingerprint_is_stable_while_nothing_changes(sandbox):
+    tools.write_file.invoke({"path": "index.html", "content": "<p>x</p>"})
+    assert tools.project_fingerprint() == tools.project_fingerprint()
+
+
+def test_fingerprint_changes_on_rewrite_add_and_delete(sandbox):
+    tools.write_file.invoke({"path": "index.html", "content": "<p>x</p>"})
+    original = tools.project_fingerprint()
+
+    tools.write_file.invoke({"path": "index.html", "content": "<p>rewritten</p>"})
+    rewritten = tools.project_fingerprint()
+    assert rewritten != original
+
+    tools.write_file.invoke({"path": "app.js", "content": "1;"})
+    added = tools.project_fingerprint()
+    assert added != rewritten
+
+    (sandbox / "app.js").unlink()
+    assert tools.project_fingerprint() != added

@@ -1,13 +1,30 @@
-"""Tests for graph wiring and the coder loop.
+"""Tests for graph wiring, the coder loop, and the review loop.
 
 The coder test guards the bug where every model failing still advanced
 current_step_idx, silently skipping a file and reporting success on a project
 that was never fully written.
+
+The write-check tests guard the opposite: a model that ends its step without
+saving the file. A live fix pass did that and was reported "fixed".
+
+The review-loop tests drive the compiled graph end to end with stubbed models,
+to pin down the loop shape: coder -> reviewer -> coder -> reviewer -> coder ->
+finish, never more than two reviews or two fix passes.
 """
+import itertools
+import re
+
 import pytest
 
 from agent import graph as g
-from agent.states import CoderState, ImplementationTask, TaskPlan
+from agent import tools
+from agent import utils
+from agent.states import (
+    CoderState, File, ImplementationTask, Plan, ReviewIssue, ReviewResult, TaskPlan,
+)
+
+_WRITES = itertools.count()
+_FILE_LINE_RE = re.compile(r"^File: (.+)$", re.MULTILINE)
 
 
 def _task_plan(*filepaths):
@@ -16,15 +33,29 @@ def _task_plan(*filepaths):
     ])
 
 
+def _requested_path(payload):
+    return _FILE_LINE_RE.search(payload["messages"][1]["content"]).group(1).strip()
+
+
+def _write_requested(payload, content=None):
+    """Save the file the coder was asked for, as a model that succeeds would.
+    Content is unique per call, so every write counts as a change."""
+    tools.write_file.invoke({
+        "path": _requested_path(payload),
+        "content": content or f"written by stub {next(_WRITES)}",
+    })
+
+
 class _StubAgent:
     """Stands in for the compiled react agent returned by create_react_agent."""
 
     def __init__(self, fail):
         self.fail = fail
 
-    def invoke(self, *args, **kwargs):
+    def invoke(self, payload, *args, **kwargs):
         if self.fail:
             raise RuntimeError("model unavailable")
+        _write_requested(payload)
         return {"messages": []}
 
 
@@ -37,14 +68,30 @@ class _StubReadFile:
 
 
 @pytest.fixture
-def no_disk_reads(monkeypatch):
-    """coding_agent reads the target file for context; keep tests off the disk."""
+def no_disk_reads(monkeypatch, tmp_path):
+    """coding_agent reads its target file and indexes the project for context;
+    keep both, and any writes, off the real generated_project/ directory."""
     monkeypatch.setattr(g, "read_file", _StubReadFile())
+    empty = tmp_path / "empty_project"
+    empty.mkdir()
+    monkeypatch.setattr(g, "GENERATED_PROJECT_ROOT", empty)
+    monkeypatch.setattr(tools, "GENERATED_PROJECT_ROOT", empty)
+
+
+@pytest.fixture
+def project(tmp_path, monkeypatch):
+    """A throwaway generated_project/, wired into both the graph and the tools."""
+    root = tmp_path / "generated_project"
+    root.mkdir()
+    monkeypatch.setattr(tools, "GENERATED_PROJECT_ROOT", root)
+    monkeypatch.setattr(g, "GENERATED_PROJECT_ROOT", root)
+    return root
 
 
 def test_graph_compiles_and_exposes_expected_state_keys():
     assert set(g.AgentState.__annotations__) == {
-        "user_prompt", "plan", "task_plan", "coder_state", "status"
+        "user_prompt", "plan", "task_plan", "coder_state", "status", "problems",
+        "review_round", "review_issues", "review_history", "failed_fixes",
     }
     assert g.agent is not None
 
@@ -67,7 +114,7 @@ def test_coder_reports_done_when_all_steps_are_complete(no_disk_reads):
 
 
 def test_coder_advances_one_step_on_success(monkeypatch, no_disk_reads):
-    monkeypatch.setattr(g, "create_react_agent", lambda model, tools: _StubAgent(fail=False))
+    monkeypatch.setattr(g, "create_react_agent", lambda model, tools_: _StubAgent(fail=False))
     state = {"task_plan": _task_plan("a.txt", "b.txt")}
     result = g.coding_agent(state)
     assert result["coder_state"].current_step_idx == 1
@@ -75,7 +122,7 @@ def test_coder_advances_one_step_on_success(monkeypatch, no_disk_reads):
 
 
 def test_coder_raises_instead_of_skipping_when_every_model_fails(monkeypatch, no_disk_reads):
-    monkeypatch.setattr(g, "create_react_agent", lambda model, tools: _StubAgent(fail=True))
+    monkeypatch.setattr(g, "create_react_agent", lambda model, tools_: _StubAgent(fail=True))
     coder_state = CoderState(task_plan=_task_plan("a.txt", "b.txt"), current_step_idx=0)
 
     with pytest.raises(RuntimeError) as exc:
@@ -86,10 +133,10 @@ def test_coder_raises_instead_of_skipping_when_every_model_fails(monkeypatch, no
 
 
 def test_coder_error_names_every_attempted_model(monkeypatch, no_disk_reads):
-    monkeypatch.setattr(g, "create_react_agent", lambda model, tools: _StubAgent(fail=True))
+    monkeypatch.setattr(g, "create_react_agent", lambda model, tools_: _StubAgent(fail=True))
     with pytest.raises(RuntimeError) as exc:
         g.coding_agent({"task_plan": _task_plan("a.txt")})
-    for model_id in g.FALLBACK_MODEL_IDS:
+    for model_id in g.CODER_MODEL_IDS:
         assert model_id in str(exc.value)
 
 
@@ -97,3 +144,581 @@ def test_task_plan_hides_attached_plan_from_the_llm_schema():
     # `plan` is attached by architect_agent after generation; exposing it in the
     # function-calling schema would ask the model to fill in the whole plan again.
     assert "plan" not in TaskPlan.model_json_schema()["properties"]
+
+
+def test_output_capped_model_is_not_used_anywhere():
+    """qwen/qwen3.6-27b refuses any request expecting over 1,000 output tokens on
+    the free tier, which both a stylesheet and a task plan exceed."""
+    assert "qwen/qwen3.6-27b" not in g.CODER_MODEL_IDS
+    assert "qwen/qwen3.6-27b" not in g.FALLBACK_MODEL_IDS
+
+
+def test_the_reliable_architect_model_leads_every_chain():
+    """gpt-oss-120b is the only model that handled the architect's nested
+    function-calling schema reliably, so it must be tried first."""
+    assert g.FALLBACK_MODEL_IDS[0] == "openai/gpt-oss-120b"
+    assert g.CODER_MODEL_IDS[0] == "openai/gpt-oss-120b"
+
+
+def test_coder_retries_a_rate_limited_model_instead_of_giving_up(monkeypatch, no_disk_reads):
+    """A per-minute limit that clears within the minute is worth waiting out on
+    the same model rather than failing the step."""
+    monkeypatch.setattr(utils.time, "sleep", lambda s: None)
+
+    class Flaky:
+        def __init__(self):
+            self.n = 0
+
+        def invoke(self, payload, *a, **k):
+            self.n += 1
+            if self.n == 1:
+                raise RuntimeError(
+                    "Error code: 429 - Rate limit reached for model `openai/gpt-oss-120b` on "
+                    "tokens per minute (TPM): Limit 8000, Used 7000, Requested 2000. "
+                    "Please try again in 5s. 'code': 'rate_limit_exceeded'")
+            _write_requested(payload)
+            return {"messages": []}
+
+    flaky = Flaky()
+    monkeypatch.setattr(g, "create_react_agent", lambda model, tools_: flaky)
+    result = g.coding_agent({"task_plan": _task_plan("style.css")})
+    assert flaky.n == 2, "should retry the rate-limited model in place"
+    assert result["coder_state"].current_step_idx == 1
+
+
+def test_verifier_reports_a_missing_stylesheet(tmp_path, monkeypatch):
+    (tmp_path / "index.html").write_text(
+        '<link rel="stylesheet" href="style.css">', encoding="utf-8")
+    monkeypatch.setattr(g, "GENERATED_PROJECT_ROOT", tmp_path)
+    problems = g.verifier_agent({})["problems"]
+    assert len(problems) == 1 and "style.css" in problems[0]
+
+
+def test_verifier_is_quiet_on_a_complete_project(tmp_path, monkeypatch):
+    (tmp_path / "index.html").write_text(
+        '<link rel="stylesheet" href="style.css">', encoding="utf-8")
+    (tmp_path / "style.css").write_text("body{}", encoding="utf-8")
+    monkeypatch.setattr(g, "GENERATED_PROJECT_ROOT", tmp_path)
+    assert g.verifier_agent({})["problems"] == []
+
+
+def test_graph_has_reviewer_and_verifier_nodes():
+    nodes = set(g.agent.get_graph().nodes)
+    assert {"reviewer", "verifier"} <= nodes
+
+
+# --- a step only counts if its file was written -------------------------------
+
+def _script_coder(monkeypatch, actions):
+    """Stub the coder with one action per model attempt:
+    'write'           saves new content
+    'skip'            ends the turn without writing
+    'same'            rewrites the file with its current content
+    'empty'           saves an empty file
+    'write-then-fail' saves a partial change, then crashes
+    Returns the list of actions actually taken."""
+    taken = []
+
+    class Scripted:
+        def invoke(self, payload, *a, **k):
+            action = actions.pop(0) if actions else "skip"
+            taken.append(action)
+            path = _requested_path(payload)
+            if action == "write":
+                _write_requested(payload)
+            elif action == "same":
+                current = (tools.GENERATED_PROJECT_ROOT / path).read_text(encoding="utf-8")
+                tools.write_file.invoke({"path": path, "content": current})
+            elif action == "empty":
+                tools.write_file.invoke({"path": path, "content": "   "})
+            elif action == "write-then-fail":
+                _write_requested(payload, "half-applied change")
+                raise RuntimeError("model crashed after writing")
+            return {"messages": []}
+
+    monkeypatch.setattr(g, "create_react_agent", lambda model, tools_: Scripted())
+    return taken
+
+
+def test_a_model_that_does_not_write_hands_the_step_to_the_next_model(project, monkeypatch):
+    taken = _script_coder(monkeypatch, ["skip", "write"])
+
+    result = g.coding_agent({"task_plan": _task_plan("index.html")})
+
+    assert taken == ["skip", "write"]
+    assert result["coder_state"].current_step_idx == 1
+    assert (project / "index.html").read_text(encoding="utf-8").startswith("written by stub")
+
+
+def test_a_first_pass_step_that_no_model_writes_stops_the_run(project, monkeypatch):
+    _script_coder(monkeypatch, ["skip", "skip", "skip"])
+
+    with pytest.raises(RuntimeError) as exc:
+        g.coding_agent({"task_plan": _task_plan("index.html")})
+
+    assert "index.html" in str(exc.value)
+    assert "without writing" in str(exc.value)
+
+
+def test_rewriting_a_file_unchanged_does_not_count(project, monkeypatch):
+    (project / "base.css").write_text(".a{}", encoding="utf-8")
+    taken = _script_coder(monkeypatch, ["same", "write"])
+
+    result = g.coding_agent({"task_plan": _task_plan("base.css")})
+
+    assert taken == ["same", "write"]
+    assert result["coder_state"].current_step_idx == 1
+
+
+def test_an_empty_file_does_not_count(project, monkeypatch):
+    taken = _script_coder(monkeypatch, ["empty", "write"])
+    g.coding_agent({"task_plan": _task_plan("app.js")})
+    assert taken == ["empty", "write"]
+
+
+def test_a_crash_after_a_partial_write_cannot_be_passed_off_by_the_next_model(project, monkeypatch):
+    """The check is per attempt: the model that completes a step must itself
+    have written the file, not merely inherited an earlier attempt's write."""
+    taken = _script_coder(monkeypatch, ["write-then-fail", "skip", "write"])
+
+    result = g.coding_agent({"task_plan": _task_plan("app.js")})
+
+    assert taken == ["write-then-fail", "skip", "write"]
+    assert result["coder_state"].current_step_idx == 1
+    assert (project / "app.js").read_text(encoding="utf-8").startswith("written by stub")
+
+
+# --- review fixes that no model can apply ------------------------------------
+# Before review the project is complete, so a fix nobody can apply must not
+# throw it away: the file is restored, the miss recorded, and the run goes on.
+
+def _fix_state(original_files, fix_file, round_no=1):
+    return {
+        "task_plan": _task_plan(*original_files),
+        "status": "FIXING",
+        "review_round": round_no,
+        "coder_state": CoderState(task_plan=_task_plan(fix_file), current_step_idx=0),
+    }
+
+
+def test_a_fix_no_model_applies_is_recorded_and_the_run_continues(project, monkeypatch):
+    """The live base.css fix ended without writing and was reported as fixed."""
+    (project / "base.css").write_text(".app{}", encoding="utf-8")
+    _script_coder(monkeypatch, ["skip", "skip", "skip"])
+
+    out = g.coding_agent(_fix_state(["index.html", "base.css"], "base.css"))
+
+    assert out["coder_state"].current_step_idx == 1
+    assert [(f["file"], f["round"]) for f in out["failed_fixes"]] == [("base.css", 1)]
+    assert (project / "base.css").read_text(encoding="utf-8") == ".app{}"
+
+
+def test_a_failed_fix_undoes_a_half_applied_change(project, monkeypatch):
+    (project / "board.js").write_text("original();", encoding="utf-8")
+    taken = _script_coder(monkeypatch, ["write-then-fail", "skip", "skip"])
+
+    out = g.coding_agent(_fix_state(["board.js"], "board.js"))
+
+    assert taken == ["write-then-fail", "skip", "skip"]
+    assert (project / "board.js").read_text(encoding="utf-8") == "original();"
+    assert out["failed_fixes"][0]["file"] == "board.js"
+
+
+def test_a_failed_fix_that_would_have_created_a_file_leaves_nothing_behind(project, monkeypatch):
+    _script_coder(monkeypatch, ["write-then-fail", "skip", "skip"])
+    g.coding_agent(_fix_state(["index.html"], "storage.js"))
+    assert not (project / "storage.js").exists()
+
+
+def test_failed_fixes_accumulate_across_rounds(project, monkeypatch):
+    (project / "a.js").write_text("a();", encoding="utf-8")
+    _script_coder(monkeypatch, ["skip", "skip", "skip"])
+    state = _fix_state(["a.js"], "a.js", round_no=2)
+    state["failed_fixes"] = [{"file": "b.js", "round": 1, "error": "earlier"}]
+
+    out = g.coding_agent(state)
+
+    assert [(f["file"], f["round"]) for f in out["failed_fixes"]] == [("b.js", 1), ("a.js", 2)]
+
+
+def test_a_successful_fix_is_not_recorded_as_failed(project, monkeypatch):
+    (project / "a.js").write_text("a();", encoding="utf-8")
+    _script_coder(monkeypatch, ["write"])
+
+    out = g.coding_agent(_fix_state(["a.js"], "a.js"))
+
+    assert "failed_fixes" not in out
+    assert out["coder_state"].current_step_idx == 1
+
+
+# --- shared class contract ---------------------------------------------------
+# Making the architect repeat the contract in every task description blew the
+# output token budget and failed the whole plan. It is emitted once and injected
+# into each coder prompt here instead.
+
+def _capture_coder_prompt(monkeypatch):
+    captured = {}
+
+    class Capturing:
+        def invoke(self, payload, *a, **k):
+            captured["user"] = payload["messages"][1]["content"]
+            _write_requested(payload)
+            return {"messages": []}
+
+    monkeypatch.setattr(g, "create_react_agent", lambda model, tools_: Capturing())
+    return captured
+
+
+def test_shared_contract_is_injected_into_the_coder_prompt(monkeypatch, no_disk_reads):
+    captured = _capture_coder_prompt(monkeypatch)
+    tp = _task_plan("index.html")
+    tp.shared_contract = ".hidden -> display:none\n.recipe-card > .title"
+    g.coding_agent({"task_plan": tp})
+
+    assert ".hidden -> display:none" in captured["user"]
+    assert "Shared class/structure contract" in captured["user"]
+
+
+def test_coder_prompt_omits_the_contract_block_when_empty(monkeypatch, no_disk_reads):
+    captured = _capture_coder_prompt(monkeypatch)
+    g.coding_agent({"task_plan": _task_plan("index.html")})
+    assert "Shared class/structure contract" not in captured["user"]
+    assert captured["user"].startswith("Project index:")
+
+
+# --- project index instead of reading every file -----------------------------
+# Telling the coder to read every earlier file grew each step's context with the
+# project, until a step of a 12-file app hit 7,197 input tokens against qwen3.8's
+# 7,000/minute limit. The coder is now handed an index instead.
+
+def test_coder_is_given_the_planned_files_and_an_index_of_written_ones(project, monkeypatch):
+    (project / "index.html").write_text(
+        '<div class="kanban-board" id="board"></div><script src="scripts/app.js" defer></script>',
+        encoding="utf-8")
+    captured = _capture_coder_prompt(monkeypatch)
+    plan = _task_plan("index.html", "styles/base.css", "scripts/storage.js", "scripts/app.js")
+
+    g.coding_agent({"task_plan": plan, "coder_state": CoderState(task_plan=plan, current_step_idx=1)})
+
+    prompt = captured["user"]
+    assert ("Files in this project, in build order: index.html, styles/base.css, "
+            "scripts/storage.js, scripts/app.js") in prompt
+    assert "Already written:" in prompt
+    assert ".kanban-board" in prompt and "#board" in prompt
+    assert prompt.index("Project index:") < prompt.index("Task:")
+
+
+def test_coder_index_includes_function_signatures(project, monkeypatch):
+    (project / "storage.js").write_text(
+        "window.StorageAPI = { updateTask(updatedTask) {}, getTasks() {} };", encoding="utf-8")
+    captured = _capture_coder_prompt(monkeypatch)
+
+    g.coding_agent({"task_plan": _task_plan("storage.js", "dragDrop.js"),
+                    "coder_state": CoderState(task_plan=_task_plan("storage.js", "dragDrop.js"),
+                                              current_step_idx=1)})
+
+    assert "StorageAPI.updateTask(updatedTask)" in captured["user"]
+
+
+def test_a_fix_pass_still_sees_every_planned_file(project, monkeypatch):
+    """A fix plan lists only the files being fixed; the coder must still see the
+    whole project, or a page fix cannot know which scripts exist."""
+    captured = _capture_coder_prompt(monkeypatch)
+    original = _task_plan("index.html", "scripts/storage.js", "scripts/app.js")
+    fix_plan = _task_plan("index.html")
+
+    g.coding_agent({"task_plan": original,
+                    "coder_state": CoderState(task_plan=fix_plan, current_step_idx=0)})
+
+    assert "index.html, scripts/storage.js, scripts/app.js" in captured["user"]
+
+
+def test_existing_file_content_is_passed_in_full(project, monkeypatch):
+    body = "<p>keep this line</p>\n" * 100   # ~2.2K chars: over the old 2K cap
+    (project / "index.html").write_text(body, encoding="utf-8")
+    captured = _capture_coder_prompt(monkeypatch)
+
+    g.coding_agent({"task_plan": _task_plan("index.html")})
+
+    assert body.strip() in captured["user"]
+    assert "truncated" not in captured["user"]
+
+
+def test_an_oversized_existing_file_is_marked_truncated(project, monkeypatch):
+    (project / "index.html").write_text("x" * (g.MAX_EXISTING_CONTENT_CHARS + 500), encoding="utf-8")
+    captured = _capture_coder_prompt(monkeypatch)
+
+    g.coding_agent({"task_plan": _task_plan("index.html")})
+
+    assert "truncated -- read_file this file for the rest" in captured["user"]
+
+
+def test_a_missing_file_is_labelled_rather_than_left_blank(project, monkeypatch):
+    captured = _capture_coder_prompt(monkeypatch)
+    g.coding_agent({"task_plan": _task_plan("scripts/new.js")})
+    assert "(file does not exist yet)" in captured["user"]
+
+
+def test_coder_instructions_no_longer_ask_it_to_read_every_file():
+    from agent.prompts import coder_prompt
+    text = coder_prompt()
+    assert "read every HTML file" not in text
+    assert "Review all existing files" not in text
+    assert "Do NOT read other files just to check" in text
+    assert "write_file ONCE" in text
+
+
+def test_shared_contract_is_not_exposed_to_the_llm_as_a_hidden_field():
+    """It must be a real schema field -- the architect has to fill it in."""
+    props = TaskPlan.model_json_schema()["properties"]
+    assert "shared_contract" in props
+    assert "plan" not in props
+
+
+# --- review loop: routing ----------------------------------------------------
+
+def test_coder_keeps_going_until_its_pass_is_done():
+    assert g.route_after_coder({}) == "coder"
+    assert g.route_after_coder({"status": "FIXING"}) == "coder"
+
+
+def test_a_finished_pass_is_reviewed_until_the_round_limit():
+    assert g.route_after_coder({"status": "DONE"}) == "reviewer"
+    assert g.route_after_coder({"status": "DONE", "review_round": 1}) == "reviewer"
+    assert g.route_after_coder({"status": "DONE", "review_round": g.MAX_REVIEW_ROUNDS}) == "verifier"
+
+
+def test_review_issues_go_back_to_the_coder_and_a_clean_review_finishes():
+    issue = ReviewIssue(file="index.html", problem="p", fix="f")
+    assert g.route_after_reviewer({"review_issues": [issue]}) == "coder"
+    assert g.route_after_reviewer({"review_issues": []}) == "verifier"
+
+
+def test_the_loop_limit_is_two_rounds():
+    assert g.MAX_REVIEW_ROUNDS == 2
+
+
+def test_reviewer_models_cap_output_to_fit_the_free_tier():
+    assert all(m.max_tokens == g.REVIEW_MAX_OUTPUT_TOKENS for m in g.REVIEWER_MODELS)
+
+
+# --- review loop: the reviewer node ------------------------------------------
+
+def _script_reviews(monkeypatch, outcomes):
+    """Stub the reviewer's model call. Each call pops the next outcome: a
+    ReviewResult to return, or an exception to raise. Returns the prompts sent."""
+    prompts = []
+
+    def fake_safe_invoke(models, structured_output=None, method=None, prompt=None, retries=2):
+        prompts.append(prompt)
+        outcome = outcomes.pop(0) if outcomes else ReviewResult()
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(g, "safe_invoke", fake_safe_invoke)
+    return prompts
+
+
+def test_reviewer_turns_issues_into_a_fix_pass(project, monkeypatch):
+    (project / "index.html").write_text('<script src="app.js" defer></script>', encoding="utf-8")
+    (project / "app.js").write_text("storage.getTasks();", encoding="utf-8")
+    _script_reviews(monkeypatch, [ReviewResult(issues=[
+        ReviewIssue(file="./index.html", problem="storage.js is never loaded", fix="add its script tag"),
+    ])])
+
+    out = g.reviewer_agent({"user_prompt": "kanban", "task_plan": _task_plan("index.html", "app.js")})
+
+    assert out["review_round"] == 1
+    assert out["status"] == "FIXING"
+    assert out["coder_state"].current_step_idx == 0
+    fix_steps = out["coder_state"].task_plan.implementation_steps
+    assert [s.filepath for s in fix_steps] == ["index.html"]
+    assert "add its script tag" in fix_steps[0].task_description
+
+
+def test_reviewer_with_no_issues_finishes(project, monkeypatch):
+    (project / "index.html").write_text("<p>x</p>", encoding="utf-8")
+    _script_reviews(monkeypatch, [ReviewResult()])
+
+    out = g.reviewer_agent({"task_plan": _task_plan("index.html")})
+
+    assert out["review_issues"] == []
+    assert out["status"] == "REVIEWED"
+    assert "coder_state" not in out
+    assert g.route_after_reviewer(out) == "verifier"
+
+
+def test_reviewer_prompt_carries_request_contract_index_findings_and_code(project, monkeypatch):
+    (project / "index.html").write_text('<div id="task-modal" class="modal hidden"></div>', encoding="utf-8")
+    prompts = _script_reviews(monkeypatch, [ReviewResult()])
+    tp = _task_plan("index.html")
+    tp.shared_contract = ".hidden -> display:none"
+
+    g.reviewer_agent({"user_prompt": "Build a kanban board", "task_plan": tp})
+
+    prompt = prompts[0]
+    assert "Build a kanban board" in prompt
+    assert ".hidden -> display:none" in prompt
+    assert "===== FILE: index.html =====" in prompt
+    assert "#task-modal" in prompt                 # from the project index
+    assert "no stylesheet defines" in prompt       # the verifier's finding
+
+
+def test_reviewer_splits_a_large_project_across_requests(project, monkeypatch):
+    """The free tier rejects a request over 8K tokens, so a big project has to be
+    reviewed in several requests -- and issues from all of them must survive."""
+    for i in range(4):
+        (project / f"part{i}.js").write_text(f"window.part{i} = 1;\n" + "x;\n" * 1500, encoding="utf-8")
+    prompts = _script_reviews(monkeypatch, [
+        ReviewResult(issues=[ReviewIssue(file="part0.js", problem="first", fix="f")]),
+        ReviewResult(),
+        ReviewResult(),
+        ReviewResult(issues=[ReviewIssue(file="part3.js", problem="last", fix="f")]),
+    ])
+
+    out = g.reviewer_agent({"task_plan": _task_plan("part0.js")})
+
+    assert len(prompts) == 4
+    # Each request carries exactly one file's code. (The instructions mention the
+    # header format too, so count real headers rather than the marker text.)
+    for prompt in prompts:
+        assert sum(f"===== FILE: part{i}.js =====" in prompt for i in range(4)) == 1
+    assert {issue.file for issue in out["review_issues"]} == {"part0.js", "part3.js"}
+
+
+def test_a_failed_review_batch_does_not_fail_the_run(project, monkeypatch):
+    """The project is already written when review runs, so a review that cannot
+    reach a model must not throw the work away."""
+    (project / "a.js").write_text("x;\n" * 2500, encoding="utf-8")
+    (project / "b.js").write_text("y;\n" * 2500, encoding="utf-8")
+    _script_reviews(monkeypatch, [
+        RuntimeError("All fallback models failed"),
+        ReviewResult(issues=[ReviewIssue(file="b.js", problem="p", fix="f")]),
+    ])
+
+    out = g.reviewer_agent({"task_plan": _task_plan("a.js", "b.js")})
+
+    assert [issue.file for issue in out["review_issues"]] == ["b.js"]
+    assert len(out["review_history"][0]["errors"]) == 1
+
+
+def test_reviewer_drops_issues_pointing_outside_the_project(project, monkeypatch):
+    (project / "index.html").write_text("<p>x</p>", encoding="utf-8")
+    _script_reviews(monkeypatch, [ReviewResult(issues=[
+        ReviewIssue(file="../../outside.js", problem="p", fix="f"),
+    ])])
+
+    out = g.reviewer_agent({"task_plan": _task_plan("index.html")})
+
+    assert out["review_issues"] == []
+
+
+# --- review loop: end to end through the compiled graph ----------------------
+
+@pytest.fixture
+def stubbed_run(project, monkeypatch):
+    """Run the real compiled graph with every model call stubbed out.
+
+    Returns (stats, review_script): push ReviewResults onto review_script to
+    decide what each review returns; stats records reviews and coder prompts,
+    and stats["write_fixes"] = False makes every fix attempt skip writing.
+    """
+    stats = {"reviews": 0, "coder_prompts": [], "write_fixes": True}
+    review_script = []
+
+    def fake_safe_invoke(models, structured_output=None, method=None, prompt=None, retries=2):
+        if structured_output is Plan:
+            return Plan(name="t", description="d", features=["f"], technologies=["HTML"],
+                        files=[File(path="index.html", purpose="page")])
+        if structured_output is TaskPlan:
+            return TaskPlan(shared_contract=".hidden -> display:none",
+                            implementation_steps=[
+                                ImplementationTask(filepath="index.html", task_description="build page")])
+        if structured_output is ReviewResult:
+            stats["reviews"] += 1
+            return review_script.pop(0) if review_script else ReviewResult()
+        raise AssertionError(f"unexpected structured output {structured_output}")
+
+    class Coder:
+        def invoke(self, payload, *a, **k):
+            content = payload["messages"][1]["content"]
+            stats["coder_prompts"].append(content)
+            if "REVIEW FIX" in content and not stats["write_fixes"]:
+                return {"messages": []}
+            _write_requested(payload)
+            return {"messages": []}
+
+    monkeypatch.setattr(g, "safe_invoke", fake_safe_invoke)
+    monkeypatch.setattr(g, "create_react_agent", lambda model, tools_: Coder())
+    return stats, review_script
+
+
+def _node_sequence(user_prompt="build it"):
+    nodes = [node for chunk in g.agent.stream({"user_prompt": user_prompt},
+                                              {"recursion_limit": 60},
+                                              stream_mode="updates")
+             for node in chunk]
+    # Collapse consecutive repeats: the coder runs once per file.
+    return [n for i, n in enumerate(nodes) if i == 0 or n != nodes[i - 1]]
+
+
+def _issue(n):
+    return ReviewResult(issues=[ReviewIssue(file="index.html", problem=f"problem {n}", fix=f"fix number {n}")])
+
+
+def test_loop_stops_after_two_rounds_even_if_issues_remain(stubbed_run):
+    stats, script = stubbed_run
+    script.extend(_issue(n) for n in range(5))  # a reviewer that is never satisfied
+
+    sequence = _node_sequence()
+
+    assert sequence == ["planner", "architect", "coder", "reviewer", "coder",
+                        "reviewer", "coder", "verifier"]
+    assert stats["reviews"] == 2
+    assert len([p for p in stats["coder_prompts"] if "REVIEW FIX" in p]) == 2
+
+
+def test_a_clean_first_review_finishes_without_a_fix_pass(stubbed_run):
+    stats, script = stubbed_run
+    script.append(ReviewResult())
+
+    assert _node_sequence() == ["planner", "architect", "coder", "reviewer", "verifier"]
+    assert not any("REVIEW FIX" in p for p in stats["coder_prompts"])
+
+
+def test_fixes_are_re_reviewed_and_a_clean_second_review_finishes(stubbed_run):
+    stats, script = stubbed_run
+    script.extend([_issue(1), ReviewResult()])
+
+    assert _node_sequence() == ["planner", "architect", "coder", "reviewer", "coder",
+                                "reviewer", "verifier"]
+    assert stats["reviews"] == 2
+    assert len([p for p in stats["coder_prompts"] if "REVIEW FIX" in p]) == 1
+
+
+def test_the_fix_pass_receives_the_feedback_and_the_contract(stubbed_run):
+    stats, script = stubbed_run
+    script.extend([_issue(7), ReviewResult()])
+
+    _node_sequence()
+
+    fix_prompt = next(p for p in stats["coder_prompts"] if "REVIEW FIX" in p)
+    assert "problem 7" in fix_prompt and "fix number 7" in fix_prompt
+    assert ".hidden -> display:none" in fix_prompt
+
+
+def test_the_run_finishes_even_when_no_review_fix_can_be_applied(stubbed_run):
+    stats, script = stubbed_run
+    stats["write_fixes"] = False
+    script.extend(_issue(n) for n in range(5))
+
+    nodes, failed = [], []
+    for chunk in g.agent.stream({"user_prompt": "build it"}, {"recursion_limit": 60},
+                                stream_mode="updates"):
+        for node, update in chunk.items():
+            nodes.append(node)
+            failed = (update or {}).get("failed_fixes", failed)
+
+    assert nodes[-1] == "verifier"
+    assert [(f["file"], f["round"]) for f in failed] == [("index.html", 1), ("index.html", 2)]
